@@ -3,8 +3,10 @@ use gtk4::{
     glib, Box, Button, Label, ListBox, Orientation, 
     ScrolledWindow, SearchEntry, Separator,
     Window, ProgressBar, TextView, Spinner, Image,
+    DropDown, StringList,
 };
-use adw::{HeaderBar, StatusPage, ViewStack, ViewSwitcher};
+use adw::{HeaderBar, StatusPage, ViewStack, ViewSwitcher, PreferencesPage, PreferencesGroup, ActionRow, ComboRow, StyleManager};
+use adw::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -90,6 +92,25 @@ impl ParuGui {
         refresh_btn.add_css_class("suggested-action");
         refresh_btn.set_tooltip_text(Some("Refresh all package lists"));
         header_bar.pack_end(&refresh_btn);
+
+        // Settings button
+        let settings_icon = Image::from_icon_name("emblem-system-symbolic");
+        let settings_btn = Button::new();
+        settings_btn.set_child(Some(&settings_icon));
+        settings_btn.add_css_class("flat");
+        settings_btn.set_tooltip_text(Some("Preferences"));
+        
+        settings_btn.set_tooltip_text(Some("Preferences"));
+        
+        let settings_btn_weak = settings_btn.downgrade();
+        settings_btn.connect_clicked(move |_| {
+            if let Some(btn) = settings_btn_weak.upgrade() {
+                if let Some(window) = btn.root().and_then(|w| w.downcast::<Window>().ok()) {
+                    Self::show_settings_dialog(&window);
+                }
+            }
+        });
+        header_bar.pack_end(&settings_btn);
 
         main_box.append(&header_bar);
 
@@ -210,7 +231,11 @@ impl ParuGui {
 
         // Initial load
         Self::refresh_installed(&installed_view.2, &gui.installed_packages, gui.task_queue.clone());
-        Self::refresh_updates(&updates_view.2, &gui.updates, gui.task_queue.clone());
+        
+        if crate::settings::get().check_updates_on_startup {
+            Self::refresh_updates(&updates_view.2, &gui.updates, gui.task_queue.clone());
+        }
+        
         Self::refresh_dashboard_stats(&dash_label_0_init, &dash_label_1_init, &dash_label_2_init);
         Self::update_refresh_time(&gui.last_refresh_label);
 
@@ -295,9 +320,25 @@ impl ParuGui {
             "user-trash-symbolic",
             "Clean package cache to free disk space"
         );
-        clean_btn.set_sensitive(false); // TODO: Implement
-        clean_btn.set_tooltip_text(Some("Coming soon: Clean package cache"));
+        let tq_clean = task_queue.clone();
+        clean_btn.connect_clicked(move |_| {
+            log_info("Starting cache cleanup from dashboard");
+            tq_clean.add_task(TaskType::CleanCache, "system".to_string());
+        });
         actions_box.append(&clean_btn);
+
+        // Orphan cleanup button
+        let orphan_btn = Self::create_action_button(
+            "Remove Orphans",
+            "edit-clear-all-symbolic",
+            "Remove unused dependencies (orphans)"
+        );
+        let tq_orphan = task_queue.clone();
+        orphan_btn.connect_clicked(move |_| {
+            log_info("Starting orphan removal from dashboard");
+            tq_orphan.add_task(TaskType::RemoveOrphans, "system".to_string());
+        });
+        actions_box.append(&orphan_btn);
 
         vbox.append(&actions_box);
 
@@ -560,6 +601,152 @@ impl ParuGui {
         dialog.present();
     }
 
+    fn show_package_details_dialog(window: &impl IsA<gtk4::Window>, package_name: &str) {
+        let dialog = Window::builder()
+            .title(format!("Package Details - {}", package_name))
+            .default_width(600)
+            .default_height(700)
+            .modal(true)
+            .transient_for(window)
+            .build();
+
+        let vbox = Box::new(Orientation::Vertical, 0);
+        
+        let header_bar = HeaderBar::new();
+        header_bar.set_show_end_title_buttons(true);
+        vbox.append(&header_bar);
+
+        let scrolled = ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_hexpand(true);
+        
+        let content_box = Box::new(Orientation::Vertical, 16);
+        content_box.set_margin_start(24);
+        content_box.set_margin_end(24);
+        content_box.set_margin_top(24);
+        content_box.set_margin_bottom(24);
+        
+        scrolled.set_child(Some(&content_box));
+        vbox.append(&scrolled);
+
+        // Header with icon and name
+        let title_box = Box::new(Orientation::Horizontal, 16);
+        let icon = Image::from_icon_name("package-x-generic-symbolic");
+        icon.set_pixel_size(64);
+        title_box.append(&icon);
+        
+        let title_info = Box::new(Orientation::Vertical, 4);
+        let name_label = Label::new(Some(package_name));
+        name_label.add_css_class("title-1");
+        name_label.set_halign(gtk4::Align::Start);
+        title_info.append(&name_label);
+        
+        let loading_label = Label::new(Some("Loading details..."));
+        loading_label.add_css_class("dim-label");
+        loading_label.set_halign(gtk4::Align::Start);
+        title_info.append(&loading_label);
+        
+        title_box.append(&title_info);
+        content_box.append(&title_box);
+
+        content_box.append(&Separator::new(Orientation::Horizontal));
+
+        // Grid for details
+        let grid = gtk4::Grid::new();
+        grid.set_column_spacing(16);
+        grid.set_row_spacing(12);
+        content_box.append(&grid);
+
+        dialog.set_child(Some(&vbox));
+        dialog.present();
+
+        let loading_label_clone = loading_label.clone();
+        let name = package_name.to_string();
+        
+        glib::spawn_future_local(async move {
+            match ParuBackend::get_package_details(&name) {
+                Ok(details) => {
+                    loading_label_clone.set_text(&details.version);
+                    
+                    let fields = [
+                        ("Description", &details.description),
+                        ("URL", &details.url),
+                        ("Licenses", &details.licenses),
+                        ("Repository", &details.groups), // Just re-using groups/repo if available, logic might need tuning
+                        ("Size", &details.installed_size),
+                        ("Packager", &details.packager),
+                        ("Build Date", &details.build_date),
+                        ("Install Date", &details.install_date),
+                        ("Validated By", &details.validated_by),
+                    ];
+
+                    let mut row = 0;
+                    for (label_text, value) in fields {
+                        if !value.is_empty() {
+                            let label = Label::new(Some(label_text));
+                            label.add_css_class("dim-label");
+                            label.set_halign(gtk4::Align::End);
+                            label.set_valign(gtk4::Align::Start);
+                            grid.attach(&label, 0, row, 1, 1);
+                            
+                            let value_label = Label::new(Some(value));
+                            value_label.set_halign(gtk4::Align::Start);
+                            value_label.set_wrap(true);
+                            value_label.set_max_width_chars(50);
+                            value_label.set_selectable(true);
+                            grid.attach(&value_label, 1, row, 1, 1);
+                            
+                            row += 1;
+                        }
+                    }
+
+                    // Dependencies section
+                    if !details.depends_on.is_empty() || !details.required_by.is_empty() {
+                         grid.attach(&Separator::new(Orientation::Horizontal), 0, row, 2, 1);
+                         row += 1;
+                    }
+
+                     if !details.depends_on.is_empty() {
+                        let label = Label::new(Some("Depends On"));
+                        label.add_css_class("heading");
+                        label.set_halign(gtk4::Align::Start);
+                        label.set_margin_top(12);
+                        grid.attach(&label, 0, row, 2, 1);
+                        row += 1;
+
+                        let val = Label::new(Some(&details.depends_on));
+                        val.set_wrap(true);
+                         val.set_max_width_chars(60);
+                        val.set_halign(gtk4::Align::Start);
+                        grid.attach(&val, 0, row, 2, 1);
+                        row += 1;
+                    }
+
+                    if !details.required_by.is_empty() {
+                        let label = Label::new(Some("Required By"));
+                        label.add_css_class("heading");
+                        label.set_halign(gtk4::Align::Start);
+                        label.set_margin_top(12);
+                        grid.attach(&label, 0, row, 2, 1);
+                        row += 1;
+
+                        let val = Label::new(Some(&details.required_by));
+                        val.set_wrap(true);
+                        val.set_max_width_chars(60);
+                        val.set_halign(gtk4::Align::Start);
+                        grid.attach(&val, 0, row, 2, 1);
+                    }
+                }
+                Err(e) => {
+                    loading_label_clone.set_text("Error loading details");
+                    let err_label = Label::new(Some(&format!("Failed to load package details: {}", e)));
+                    err_label.add_css_class("error");
+                    content_box.append(&err_label);
+                }
+            }
+        });
+    }
+
     fn show_queue_window(task_queue: Arc<TaskQueue>) {
         let window = Window::builder()
             .title("Task Queue")
@@ -680,6 +867,8 @@ impl ParuGui {
             TaskType::Install => "list-add-symbolic",
             TaskType::Remove => "list-remove-symbolic",
             TaskType::Update => "software-update-available-symbolic",
+            TaskType::CleanCache => "user-trash-symbolic",
+            TaskType::RemoveOrphans => "edit-clear-all-symbolic",
         };
         let task_icon = Image::from_icon_name(icon_name);
         task_icon.set_pixel_size(20);
@@ -689,6 +878,8 @@ impl ParuGui {
             TaskType::Install => "Install",
             TaskType::Remove => "Remove",
             TaskType::Update => "Update",
+            TaskType::CleanCache => "Clean Cache",
+            TaskType::RemoveOrphans => "Remove Orphans",
         };
         
         let title_label = Label::new(Some(&format!("{}: {}", task_type_str, task.package_name)));
@@ -973,10 +1164,22 @@ impl ParuGui {
         
         vbox.append(&header_box);
 
+        // Controls Box (Search + Sort)
+        let controls_box = Box::new(Orientation::Horizontal, 8);
+        
         // Search entry for filtering
         let search_entry = SearchEntry::new();
-        search_entry.set_placeholder_text(Some("Filter installed packages by name or description..."));
-        vbox.append(&search_entry);
+        search_entry.set_placeholder_text(Some("Filter..."));
+        search_entry.set_hexpand(true);
+        controls_box.append(&search_entry);
+
+        // Sort DropDown
+        let sort_model = StringList::new(&["Name (A-Z)", "Name (Z-A)", "Repository"]);
+        let sort_dropdown = DropDown::new(Some(sort_model), None::<gtk4::Expression>);
+        sort_dropdown.set_width_request(140);
+        controls_box.append(&sort_dropdown);
+        
+        vbox.append(&controls_box);
 
         let scrolled = ScrolledWindow::new();
         scrolled.set_vexpand(true);
@@ -990,34 +1193,36 @@ impl ParuGui {
         let list_box_rc = Rc::new(RefCell::new(list_box));
         let search_entry_rc = Rc::new(RefCell::new(search_entry.clone()));
 
-        // Filter handler
+        // Handlers
         let list_box_clone = list_box_rc.clone();
         let packages_clone = packages.clone();
         let task_queue_clone = task_queue.clone();
         let count_clone = count_label_rc.clone();
-        
-        search_entry.connect_search_changed(move |entry| {
-            let query = entry.text().to_string().to_lowercase();
+        let search_entry_clone = search_entry.clone();
+        let sort_dropdown_clone = sort_dropdown.clone();
+
+        // Common update function logic
+        let update_view = Rc::new(move || {
             let all_packages = packages_clone.borrow();
+            let query = search_entry_clone.text().to_string();
+            let sort_idx = sort_dropdown_clone.selected();
             
-            if query.is_empty() {
-                // Show all packages
-                Self::update_package_list_with_remove(&list_box_clone.borrow(), &all_packages, task_queue_clone.clone());
-                count_clone.borrow().set_text(&format!("{} packages", all_packages.len()));
-            } else {
-                // Filter packages
-                let filtered: Vec<Package> = all_packages
-                    .iter()
-                    .filter(|pkg| {
-                        pkg.name.to_lowercase().contains(&query) ||
-                        pkg.description.to_lowercase().contains(&query)
-                    })
-                    .cloned()
-                    .collect();
-                
-                count_clone.borrow().set_text(&format!("{} / {} packages", filtered.len(), all_packages.len()));
-                Self::update_package_list_with_remove(&list_box_clone.borrow(), &filtered, task_queue_clone.clone());
-            }
+            let filtered = Self::filter_and_sort_packages(&all_packages, &query, sort_idx);
+            
+            count_clone.borrow().set_text(&format!("{} / {} packages", filtered.len(), all_packages.len()));
+            Self::update_package_list_with_remove(&list_box_clone.borrow(), &filtered, task_queue_clone.clone());
+        });
+
+        // Connect Search
+        let update_1 = update_view.clone();
+        search_entry.connect_search_changed(move |_| {
+            update_1();
+        });
+
+        // Connect Sort
+        let update_2 = update_view.clone();
+        sort_dropdown.connect_selected_notify(move |_| {
+            update_2();
         });
 
         (vbox, packages, list_box_rc, search_entry_rc)
@@ -1211,6 +1416,24 @@ impl ParuGui {
         if show_actions {
             let action_box = Box::new(Orientation::Horizontal, 8);
             
+            let info_icon = Image::from_icon_name("dialog-information-symbolic");
+            let info_btn = Button::new();
+            info_btn.set_child(Some(&info_icon));
+            info_btn.add_css_class("flat");
+            info_btn.add_css_class("circular");
+            info_btn.set_tooltip_text(Some("View details"));
+            
+            let pkg_name_clone = package.name.clone();
+            let row_weak = row_box.downgrade();
+            info_btn.connect_clicked(move |_| {
+                if let Some(row) = row_weak.upgrade() {
+                    if let Some(window) = row.root().and_then(|w| w.downcast::<gtk4::Window>().ok()) {
+                        Self::show_package_details_dialog(&window, &pkg_name_clone);
+                    }
+                }
+            });
+            action_box.append(&info_btn);
+
             let install_icon = Image::from_icon_name("list-add-symbolic");
             let install_btn = Button::new();
             install_btn.set_child(Some(&install_icon));
@@ -1239,6 +1462,28 @@ impl ParuGui {
             });
             
             action_box.append(&install_btn);
+            row_box.append(&action_box);
+        } else {
+             // For updates view or others where show_actions is false, we still want details
+            let action_box = Box::new(Orientation::Horizontal, 8);
+            
+            let info_icon = Image::from_icon_name("dialog-information-symbolic");
+            let info_btn = Button::new();
+            info_btn.set_child(Some(&info_icon));
+            info_btn.add_css_class("flat");
+            info_btn.add_css_class("circular");
+            info_btn.set_tooltip_text(Some("View details"));
+            
+            let pkg_name_clone = package.name.clone();
+            let row_weak = row_box.downgrade();
+            info_btn.connect_clicked(move |_| {
+                if let Some(row) = row_weak.upgrade() {
+                    if let Some(window) = row.root().and_then(|w| w.downcast::<gtk4::Window>().ok()) {
+                        Self::show_package_details_dialog(&window, &pkg_name_clone);
+                    }
+                }
+            });
+            action_box.append(&info_btn);
             row_box.append(&action_box);
         }
 
@@ -1327,6 +1572,25 @@ impl ParuGui {
         // Remove button
         let action_box = Box::new(Orientation::Horizontal, 8);
         
+        // Info button
+        let info_icon = Image::from_icon_name("dialog-information-symbolic");
+        let info_btn = Button::new();
+        info_btn.set_child(Some(&info_icon));
+        info_btn.add_css_class("flat");
+        info_btn.add_css_class("circular");
+        info_btn.set_tooltip_text(Some("View details"));
+        
+        let pkg_name_info = package.name.clone();
+        let row_weak = row_box.downgrade();
+        info_btn.connect_clicked(move |_| {
+            if let Some(row) = row_weak.upgrade() {
+                 if let Some(window) = row.root().and_then(|w| w.downcast::<gtk4::Window>().ok()) {
+                    Self::show_package_details_dialog(&window, &pkg_name_info);
+                }
+            }
+        });
+        action_box.append(&info_btn);
+
         let remove_icon = Image::from_icon_name("user-trash-symbolic");
         let remove_btn = Button::new();
         remove_btn.set_child(Some(&remove_icon));
@@ -1370,6 +1634,12 @@ impl ParuGui {
         glib::spawn_future_local(async move {
             match ParuBackend::list_updates() {
                 Ok(pkgs) => {
+                    if !pkgs.is_empty() && crate::settings::get().notifications_enabled {
+                         crate::utils::send_notification(
+                            "Updates Available", 
+                            &format!("{} new updates including: {}", pkgs.len(), pkgs.first().map(|p| p.name.as_str()).unwrap_or(""))
+                        );
+                    }
                     *packages.borrow_mut() = pkgs.clone();
                     Self::update_package_list(&list_box.borrow(), &pkgs, false, task_queue);
                 }
@@ -1413,5 +1683,174 @@ impl ParuGui {
             label_clone.borrow().set_text(&time_str);
             glib::ControlFlow::Continue
         });
+    }
+
+    fn filter_and_sort_packages(packages: &[Package], query: &str, sort_idx: u32) -> Vec<Package> {
+        let query = query.to_lowercase();
+        let mut filtered: Vec<Package> = if query.is_empty() {
+            packages.to_vec()
+        } else {
+            packages.iter()
+                .filter(|pkg| {
+                    pkg.name.to_lowercase().contains(&query) ||
+                    pkg.description.to_lowercase().contains(&query)
+                })
+                .cloned()
+                .collect()
+        };
+
+        match sort_idx {
+            0 => filtered.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())), // Name A-Z
+            1 => filtered.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase())), // Name Z-A
+            2 => filtered.sort_by(|a, b| a.repository.cmp(&b.repository).then_with(|| a.name.cmp(&b.name))), // Repository then Name
+            _ => {},
+        }
+        
+        filtered
+    }
+
+    fn show_settings_dialog(parent_window: &(impl IsA<gtk4::Window> + gtk4::prelude::WidgetExt)) {
+        let window = Window::builder()
+            .title("Preferences")
+            .default_width(500)
+            .default_height(400)
+            .modal(true)
+            .transient_for(parent_window)
+            .build();
+            
+        let vbox = Box::new(Orientation::Vertical, 0);
+        
+        let header = HeaderBar::new();
+        vbox.append(&header);
+        
+        let prefs = PreferencesPage::new();
+        
+        let group = PreferencesGroup::new();
+        group.set_title("General");
+        
+        // Notifications
+        let row_notify = ActionRow::new();
+        row_notify.set_title("System Notifications");
+        row_notify.set_subtitle("Show desktop notifications for updates");
+        
+        let switch_notify = gtk4::Switch::new();
+        switch_notify.set_active(crate::settings::get().notifications_enabled);
+        switch_notify.set_valign(gtk4::Align::Center);
+        switch_notify.connect_state_set(|_, state| {
+            crate::settings::update(|s| s.notifications_enabled = state);
+            glib::Propagation::Proceed
+        });
+        row_notify.add_suffix(&switch_notify);
+        group.add(&row_notify);
+
+        // Check Updates on Startup
+        let row_startup = ActionRow::new();
+        row_startup.set_title("Check on Startup");
+        row_startup.set_subtitle("Automatically check for updates when Parut starts");
+        
+        let switch_startup = gtk4::Switch::new();
+        switch_startup.set_active(crate::settings::get().check_updates_on_startup);
+        switch_startup.set_valign(gtk4::Align::Center);
+        switch_startup.connect_state_set(|_, state| {
+            crate::settings::update(|s| s.check_updates_on_startup = state);
+            glib::Propagation::Proceed
+        });
+        row_startup.add_suffix(&switch_startup);
+        group.add(&row_startup);
+
+        // Confirm Interactions (Placeholder logic for now, but UI exists)
+        // Note: TaskQueue doesn't currently support improved interactive confirmation prompts easily
+        // so we save the setting but might not use it everywhere yet.
+        let row_confirm = ActionRow::new();
+        row_confirm.set_title("Confirm Actions");
+        row_confirm.set_subtitle("Ask for confirmation before critical actions");
+        
+        let switch_confirm = gtk4::Switch::new();
+        switch_confirm.set_active(crate::settings::get().confirm_actions);
+        switch_confirm.set_valign(gtk4::Align::Center);
+        switch_confirm.connect_state_set(|_, state| {
+            crate::settings::update(|s| s.confirm_actions = state);
+            glib::Propagation::Proceed
+        });
+        row_confirm.add_suffix(&switch_confirm);
+        group.add(&row_confirm);
+
+        // Density
+        let row_density = ActionRow::new();
+        row_density.set_title("Compact Mode");
+        row_density.set_subtitle("Reduce spacing in package lists");
+        
+        let switch_density = gtk4::Switch::new();
+        // Sync with settings, fallback to checking window class if needed/first run
+        let is_compact = crate::settings::get().compact_mode;
+        switch_density.set_active(is_compact);
+        switch_density.set_valign(gtk4::Align::Center);
+        
+        // Ensure visual state matches setting on dialog open
+        let parent_clone = parent_window.clone();
+        if is_compact && !parent_clone.has_css_class("compact-mode") {
+             parent_clone.add_css_class("compact-mode");
+        }
+
+        let parent_weak = parent_clone.downgrade();
+        switch_density.connect_state_set(move |_, state| {
+             // Save setting
+             crate::settings::update(|s| s.compact_mode = state);
+             
+             // Apply visual change
+             if let Some(win) = parent_weak.upgrade() {
+                 if state {
+                     win.add_css_class("compact-mode");
+                 } else {
+                     win.remove_css_class("compact-mode");
+                 }
+             }
+             glib::Propagation::Proceed
+        });
+
+        row_density.add_suffix(&switch_density);
+        group.add(&row_density);
+        
+        prefs.add(&group);
+
+        // Appearance Group
+        let appearance_group = PreferencesGroup::new();
+        appearance_group.set_title("Appearance");
+
+        let theme_row = ComboRow::new();
+        theme_row.set_title("Color Scheme");
+        theme_row.set_subtitle("Choose application appearance");
+        
+        let model = StringList::new(&["System Default", "Light", "Dark"]);
+        theme_row.set_model(Some(&model));
+        
+        // Set initial selection
+        let style_manager = StyleManager::default();
+        let current_scheme = style_manager.color_scheme();
+        let initial_idx = match current_scheme {
+            adw::ColorScheme::Default => 0,
+            adw::ColorScheme::ForceLight => 1,
+            adw::ColorScheme::ForceDark => 2,
+            _ => 0,
+        };
+        theme_row.set_selected(initial_idx);
+
+        theme_row.connect_selected_notify(move |row| {
+             let style_manager = StyleManager::default();
+             match row.selected() {
+                 0 => style_manager.set_color_scheme(adw::ColorScheme::Default),
+                 1 => style_manager.set_color_scheme(adw::ColorScheme::ForceLight),
+                 2 => style_manager.set_color_scheme(adw::ColorScheme::ForceDark),
+                 _ => {},
+             }
+        });
+        
+        appearance_group.add(&theme_row);
+        prefs.add(&appearance_group);
+        
+        vbox.append(&prefs);
+        
+        window.set_child(Some(&vbox));
+        window.present();
     }
 }

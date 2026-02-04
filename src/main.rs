@@ -7,6 +7,8 @@ mod ui;
 mod paru;
 mod task_queue;
 mod logger;
+mod utils;
+mod settings;
 
 use ui::ParuGui;
 use logger::log_info;
@@ -17,6 +19,9 @@ const CSS: &str = include_str!("style.css");
 fn main() -> glib::ExitCode {
     // Log application start
     log_info("Parut application starting");
+    
+    // Initialize settings
+    settings::init();
     
     let app = Application::builder()
         .application_id(APP_ID)
@@ -66,6 +71,9 @@ fn build_ui(app: &Application) {
 
     // Add window CSS class for custom styling
     window.add_css_class("main-window");
+    if crate::settings::get().compact_mode {
+        window.add_css_class("compact-mode");
+    }
 
     let gui = ParuGui::new();
     window.set_content(Some(gui.main_widget()));

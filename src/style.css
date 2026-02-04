@@ -1,1 +1,67 @@
 /* Native Adwaita styling */
+
+/* Standard List Styling */
+.boxed-list {
+    background-color: @card_bg_color;
+    border-radius: 8px;
+    padding: 6px;
+}
+
+.package-row {
+    transition: background-color 200ms;
+    border-radius: 6px;
+}
+
+.package-row:hover {
+    background-color: alpha(@text_color, 0.05);
+}
+
+/* Compact Mode Overrides */
+.compact-mode .package-row {
+    margin-top: 4px;
+    margin-bottom: 4px;
+    padding-top: 4px;
+    padding-bottom: 4px;
+}
+
+.compact-mode .heading {
+    font-size: 14px;
+}
+
+.compact-mode image {
+    -gtk-icon-size: 16px;
+}
+
+/* Badges */
+.repo-tag {
+    background-color: alpha(@text_color, 0.1);
+    color: @text_color;
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 10px;
+    font-weight: bold;
+    margin-left: 8px;
+}
+
+.repo-tag-aur {
+    background-color: alpha(#ffb300, 0.2);
+    color: #e65100;
+}
+
+.repo-tag-core {
+    background-color: alpha(#2e7d32, 0.2);
+    color: #1b5e20;
+}
+
+.repo-tag-extra {
+    background-color: alpha(#1565c0, 0.2);
+    color: #0d47a1;
+}
+
+.version-badge {
+    background-color: alpha(@text_color, 0.05);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-family: monospace;
+    font-size: 11px;
+}

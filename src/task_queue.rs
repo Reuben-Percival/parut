@@ -7,6 +7,8 @@ pub enum TaskType {
     Install,
     Remove,
     Update,
+    CleanCache,
+    RemoveOrphans,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -251,6 +253,12 @@ impl TaskWorker {
             }
             TaskType::Update => {
                 ParuBackend::update_system(output_callback)
+            }
+            TaskType::CleanCache => {
+                ParuBackend::clean_cache(output_callback)
+            }
+            TaskType::RemoveOrphans => {
+                ParuBackend::remove_orphans(output_callback)
             }
         }
     }

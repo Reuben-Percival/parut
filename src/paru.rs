@@ -12,6 +12,30 @@ pub struct Package {
     pub installed_version: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PackageDetails {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub url: String,
+    pub licenses: String,
+    pub groups: String,
+    pub provides: String,
+    pub depends_on: String,
+    pub optional_deps: String,
+    pub required_by: String,
+    pub optional_for: String,
+    pub conflicts_with: String,
+    pub replaces: String,
+    pub installed_size: String,
+    pub packager: String,
+    pub build_date: String,
+    pub install_date: String,
+    pub install_reason: String,
+    pub install_script: String,
+    pub validated_by: String,
+}
+
 pub struct ParuBackend;
 
 impl ParuBackend {
@@ -110,32 +134,124 @@ impl ParuBackend {
     pub fn list_updates() -> Result<Vec<Package>, String> {
         log_debug("Checking for available updates");
 
-        let output = Command::new("paru")
-        .arg("-Qu")
-        .output()
-        .map_err(|e| {
-            let err = format!("Failed to execute paru: {}", e);
-            log_error(&err);
-            err
-        })?;
+        let mut packages = Vec::new();
+        let mut seen_packages = HashSet::new();
 
-        if !output.status.success() && output.status.code() != Some(1) {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let err = format!("Paru failed: {}", stderr);
-            log_error(&err);
-            return Err(err);
+        // 1. Try to get official repo updates via checkupdates (safely syncs DB)
+        // If checkupdates is missing, we rely on paru -Qu (local DB only)
+        let use_checkupdates = Command::new("which")
+            .arg("checkupdates")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if use_checkupdates {
+            log_info("Using checkupdates for repo updates");
+            match Command::new("checkupdates").output() {
+                Ok(output) => {
+                    if output.status.success() {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let updates = Self::parse_update_lines(&stdout, "repo");
+                        for pkg in updates {
+                            seen_packages.insert(pkg.name.clone());
+                            packages.push(pkg);
+                        }
+                    }
+                }
+                Err(e) => log_error(&format!("checkupdates failed: {}", e)),
+            }
+        } 
+
+        // 2. Get AUR updates (or all if checkupdates failed/missing) via paru
+        // -Qu: Upgradeable
+        // -a: AUR only (if we used checkupdates), otherwise omit -a to get all
+        let mut cmd = Command::new("paru");
+        cmd.arg("-Qu").arg("--noconfirm"); // Non-interactive
+        
+        // If we successfully used checkupdates, we only need AUR from paru
+        if use_checkupdates {
+            cmd.arg("-a");
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        if stdout.trim().is_empty() {
-            log_info("No updates available");
-            return Ok(Vec::new());
+        match cmd.output() {
+            Ok(output) => {
+                // paru returns 1 if no updates found, which is not an error for us
+                if output.status.success() || output.status.code() == Some(1) {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let updates = Self::parse_update_lines(&stdout, if use_checkupdates { "aur" } else { "unknown" });
+                    
+                    for pkg in updates {
+                        if !seen_packages.contains(&pkg.name) {
+                            seen_packages.insert(pkg.name.clone());
+                            packages.push(pkg);
+                        }
+                    }
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    log_error(&format!("paru -Qu failed: {}", stderr));
+                }
+            }
+            Err(e) => log_error(&format!("Failed to execute paru: {}", e)),
+        }
+        
+        // If we didn't use checkupdates, we need to identify repos
+        if !use_checkupdates && !packages.is_empty() {
+             let foreign_set = Self::get_foreign_packages();
+             let package_names: Vec<&str> = packages.iter()
+                .filter(|p| !foreign_set.contains(&p.name))
+                .map(|p| p.name.as_str())
+                .collect();
+                
+             let repo_map = if !package_names.is_empty() {
+                Self::get_repos_batch(&package_names)
+             } else {
+                HashMap::new()
+             };
+             
+             for pkg in &mut packages {
+                 if foreign_set.contains(&pkg.name) {
+                     pkg.repository = "aur".to_string();
+                 } else if let Some(repo) = repo_map.get(&pkg.name) {
+                     pkg.repository = repo.clone();
+                 } else {
+                     pkg.repository = "core".to_string(); // Fallback assumption
+                 }
+             }
         }
 
-        let packages = Self::parse_updates_output_optimized(&stdout);
         log_info(&format!("Found {} available updates", packages.len()));
         Ok(packages)
+    }
+
+    fn parse_update_lines(output: &str, default_repo: &str) -> Vec<Package> {
+         output.lines()
+            .filter_map(|line| {
+                // Format: name old -> new
+                // Filter out "[ignored]" or other noise
+                let clean_line = line.replace("[ignored]", "").trim().to_string();
+                let parts: Vec<&str> = clean_line.split_whitespace().collect();
+                
+                if parts.len() >= 4 {
+                    // parts[0] might be 'repo/name' or just 'name'
+                    let raw_name = parts[0];
+                    let (repo, name) = if let Some((r, n)) = raw_name.split_once('/') {
+                        (r, n)
+                    } else {
+                        (default_repo, raw_name)
+                    };
+
+                    Some(Package {
+                        name: name.to_string(),
+                        version: parts[3].to_string(),
+                        description: String::new(),
+                        repository: repo.to_string(),
+                        installed_version: Some(parts[1].to_string()),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub fn is_aur_package(name: &str) -> bool {
@@ -250,6 +366,131 @@ impl ParuBackend {
         }
 
         result
+    }
+
+    pub fn clean_cache<F>(output_callback: F) -> Result<(), String>
+    where
+    F: Fn(String) + Send + 'static,
+    {
+        log_info("Starting cache cleanup");
+
+        // -Sc removes uninstalled packages from cache
+        let result = Self::run_paru_without_root(&["-Sc", "--noconfirm"],
+                                                 output_callback);
+
+        match &result {
+            Ok(_) => log_info("Cache cleanup completed successfully"),
+            Err(e) => log_error(&format!("Cache cleanup failed: {}", e)),
+        }
+
+        result
+    }
+
+
+
+    pub fn remove_orphans<F>(output_callback: F) -> Result<(), String>
+    where
+    F: Fn(String) + Send + 'static,
+    {
+        log_info("Starting orphan removal");
+
+        // -c removes orphans (recursive)
+        let result = Self::run_paru_without_root(&["-c", "--noconfirm"],
+                                                 output_callback);
+
+        match &result {
+            Ok(_) => log_info("Orphan removal completed successfully"),
+            Err(e) => log_error(&format!("Orphan removal failed: {}", e)),
+        }
+
+        result
+    }
+
+    pub fn get_package_details(name: &str) -> Result<PackageDetails, String> {
+        let is_installed = Self::is_package_installed(name);
+        
+        // Use -Qi for installed, -Si for sync/aur
+        let flag = if is_installed { "-Qi" } else { "-Si" };
+        
+        let output = Command::new("paru")
+            .arg(flag)
+            .arg(name)
+            .output()
+            .map_err(|e| format!("Failed to execute paru: {}", e))?;
+
+        if !output.status.success() {
+            return Err(format!("Failed to get details for {}", name));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Self::parse_package_details(&stdout, name)
+    }
+
+    fn is_package_installed(name: &str) -> bool {
+        Command::new("pacman")
+            .arg("-Qi")
+            .arg(name)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn parse_package_details(output: &str, name: &str) -> Result<PackageDetails, String> {
+        let mut details = PackageDetails {
+            name: name.to_string(),
+            version: String::new(),
+            description: String::new(),
+            url: String::new(),
+            licenses: String::new(),
+            groups: String::new(),
+            provides: String::new(),
+            depends_on: String::new(),
+            optional_deps: String::new(),
+            required_by: String::new(),
+            optional_for: String::new(),
+            conflicts_with: String::new(),
+            replaces: String::new(),
+            installed_size: String::new(),
+            packager: String::new(),
+            build_date: String::new(),
+            install_date: String::new(),
+            install_reason: String::new(),
+            install_script: String::new(),
+            validated_by: String::new(),
+        };
+
+        for line in output.lines() {
+            if let Some((key, value)) = line.split_once(':') {
+                let key = key.trim();
+                let value = value.trim().to_string();
+
+                match key {
+                    "Name" => details.name = value,
+                    "Version" => details.version = value,
+                    "Description" => details.description = value,
+                    "URL" => details.url = value,
+                    "Licenses" => details.licenses = value,
+                    "Groups" => details.groups = value,
+                    "Provides" => details.provides = value,
+                    "Depends On" => details.depends_on = value,
+                    "Optional Deps" => details.optional_deps = value,
+                    "Required By" => details.required_by = value,
+                    "Optional For" => details.optional_for = value,
+                    "Conflicts With" => details.conflicts_with = value,
+                    "Replaces" => details.replaces = value,
+                    "Installed Size" => details.installed_size = value,
+                    "Packager" => details.packager = value,
+                    "Build Date" => details.build_date = value,
+                    "Install Date" => details.install_date = value,
+                    "Install Reason" => details.install_reason = value,
+                    "Install Script" => details.install_script = value,
+                    "Validated By" => details.validated_by = value,
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(details)
     }
 
     fn run_paru_with_output<F>(args: &[&str], output_callback: F) -> Result<(),
