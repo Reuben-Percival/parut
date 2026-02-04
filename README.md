@@ -1,4 +1,4 @@
-# 🚀 Parut
+#  Parut
 
 <div align="center">
 
@@ -15,19 +15,16 @@
 
 ## ✨ Features
 
-- **🎨 Modern UI** - Built with GTK4 and libadwaita for a beautiful, native GNOME experience
-- **🔍 Package Search** - Search packages from official Arch repositories and the AUR with debounced, fast search
-- **📦 Installed Packages** - View and manage all your installed packages with easy filtering
-- **🔄 System Updates** - Check for and apply system updates with one click
-- **📋 Task Queue** - Queue multiple package operations and monitor their progress
-- **🛡️ PKGBUILD Review** - Review AUR package build scripts before installation for security
-- **📊 Dashboard** - See system stats at a glance including installed packages, AUR packages, and available updates
+- ** Modern UI** - Built with GTK4 and libadwaita for a beautiful, native GNOME experience
+- ** Package Search** - Search packages from official Arch repositories and the AUR with debounced, fast search
+- ** Installed Packages** - View and manage all your installed packages with easy filtering
+- ** System Updates** - Check for and apply system updates with one click
+- ** Task Queue** - Queue multiple package operations and monitor their progress
+- ** PKGBUILD Review** - Review AUR package build scripts before installation for security
+- ** Dashboard** - See system stats at a glance including installed packages, AUR packages, and available updates
 
-## 📸 Screenshots
 
-*Coming soon!*
-
-## 🛠️ Prerequisites
+##  Prerequisites
 
 Before installing Parut, ensure you have:
 
@@ -49,7 +46,7 @@ makepkg -si
 sudo pacman -S gtk4 libadwaita
 ```
 
-## 📦 Installation
+##  Installation
 
 ### From Source
 
@@ -138,7 +135,7 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 
 This project is licensed under the GPL-3.0 License - see the [LICENSE](LICENSE) file for details.
 
-## 🙏 Acknowledgments
+## 🙏 Acknowledgments ( support these guys not me)
 
 - [Paru](https://github.com/Morganamilo/paru) - The amazing AUR helper that powers this application
 - [GTK4](https://gtk.org/) - The cross-platform widget toolkit
