@@ -1,0 +1,22 @@
+[package]
+name = "parut"
+version = "0.2.0"
+edition = "2021"
+authors = ["Parut Contributors"]
+description = "A beautiful graphical frontend for the Paru AUR helper"
+license = "GPL-3.0"
+repository = "https://github.com/parut/parut"
+keywords = ["arch", "linux", "aur", "paru", "package-manager"]
+categories = ["gui", "package-manager"]
+
+[dependencies]
+gtk4 = "0.9"
+adw = { version = "0.7", package = "libadwaita", features = ["v1_5"] }
+chrono = "0.4"
+dirs = "5.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
