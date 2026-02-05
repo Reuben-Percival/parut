@@ -109,7 +109,7 @@ Logs are saved to:
 
 ## 🔒 Security
 
-When installing AUR packages, Parut will show you the PKGBUILD for review before proceeding. **Always review PKGBUILDs** for potentially malicious content before installation.
+When installing AUR packages, Parut will show you the PKGBUILD for review before proceeding. **Always review PKGBUILDs** for potentially malicious content before installation. DO NOT INSTALL STUFF THAT IS TO GOOD TO BE TRUE AKA firefox-patched-ultrafps
 
 ## 🤝 Contributing
 
