@@ -52,7 +52,7 @@ sudo pacman -S gtk4 libadwaita
 
 ```bash
 # Clone the repository
-git clone https://github.com/akirathelinuxguy/parut.git
+git clone https://github.com/Reuben-Percival/parut.git
 cd parut
 
 # Build and install
