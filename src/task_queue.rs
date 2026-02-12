@@ -1,5 +1,4 @@
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,34 +41,17 @@ impl Task {
     }
 }
 
-#[allow(dead_code)]
-pub enum QueueMessage {
-    AddTask(TaskType, String),
-    UpdateTaskStatus(usize, TaskStatus),
-    AppendOutput(usize, String),
-    GetTasks,
-    ClearCompleted,
-}
-
 pub struct TaskQueue {
     tasks: Arc<Mutex<Vec<Task>>>,
     next_id: Arc<Mutex<usize>>,
-    #[allow(dead_code)]
-    tx: Sender<QueueMessage>,
-    #[allow(dead_code)]
-    rx: Arc<Mutex<Receiver<QueueMessage>>>,
     update_callback: Arc<Mutex<Option<Box<dyn Fn() + Send>>>>,
 }
 
 impl TaskQueue {
     pub fn new() -> Self {
-        let (tx, rx) = channel();
-        
         Self {
             tasks: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(Mutex::new(0)),
-            tx,
-            rx: Arc::new(Mutex::new(rx)),
             update_callback: Arc::new(Mutex::new(None)),
         }
     }
@@ -89,15 +71,15 @@ impl TaskQueue {
         *next_id += 1;
 
         let task = Task::new(id, task_type, package_name);
-        
+
         let mut tasks = self.tasks.lock().unwrap();
         tasks.push(task);
-        
+
         // Trigger UI update
         if let Some(callback) = self.update_callback.lock().unwrap().as_ref() {
             callback();
         }
-        
+
         id
     }
 
@@ -110,7 +92,7 @@ impl TaskQueue {
         if let Some(task) = tasks.iter_mut().find(|t| t.id == task_id) {
             task.status = status;
         }
-        
+
         // Trigger UI update
         if let Some(callback) = self.update_callback.lock().unwrap().as_ref() {
             callback();
@@ -125,10 +107,10 @@ impl TaskQueue {
             if let Some(p) = progress {
                 task.progress = Some(p);
             }
-            
+
             task.output.push(line);
         }
-        
+
         // Trigger UI update
         if let Some(callback) = self.update_callback.lock().unwrap().as_ref() {
             callback();
@@ -145,7 +127,7 @@ impl TaskQueue {
                 }
             }
         }
-        
+
         // Parse makepkg progress: "(1/4) checking keys..."
         if line.contains("(") && line.contains("/") && line.contains(")") {
             if let Some(start) = line.find('(') {
@@ -154,7 +136,7 @@ impl TaskQueue {
                     if let Some(slash) = nums.find('/') {
                         if let (Ok(current), Ok(total)) = (
                             nums[..slash].parse::<f64>(),
-                            nums[slash + 1..].parse::<f64>()
+                            nums[slash + 1..].parse::<f64>(),
                         ) {
                             return Some(current / total);
                         }
@@ -162,14 +144,14 @@ impl TaskQueue {
                 }
             }
         }
-        
+
         None
     }
 
     pub fn clear_completed(&self) {
         let mut tasks = self.tasks.lock().unwrap();
         tasks.retain(|t| !matches!(t.status, TaskStatus::Completed | TaskStatus::Failed(_)));
-        
+
         // Trigger UI update
         if let Some(callback) = self.update_callback.lock().unwrap().as_ref() {
             callback();
@@ -178,7 +160,8 @@ impl TaskQueue {
 
     pub fn get_next_queued_task(&self) -> Option<Task> {
         let tasks = self.tasks.lock().unwrap();
-        tasks.iter()
+        tasks
+            .iter()
             .find(|t| t.status == TaskStatus::Queued)
             .cloned()
     }
@@ -200,7 +183,7 @@ impl TaskWorker {
 
     pub fn start(&self) {
         let queue = self.queue.clone();
-        
+
         thread::spawn(move || {
             loop {
                 // Check if there's already a running task
@@ -213,10 +196,10 @@ impl TaskWorker {
                 if let Some(task) = queue.get_next_queued_task() {
                     // Mark as running
                     queue.update_task_status(task.id, TaskStatus::Running);
-                    
+
                     // Execute the task
                     let result = Self::execute_task(&queue, &task);
-                    
+
                     // Update status based on result
                     match result {
                         Ok(_) => {
@@ -236,30 +219,38 @@ impl TaskWorker {
 
     fn execute_task(queue: &Arc<TaskQueue>, task: &Task) -> Result<(), String> {
         use crate::paru::ParuBackend;
-        
+        use crate::settings;
+        use crate::utils;
+
         let task_id = task.id;
         let queue_clone = queue.clone();
-        
+
         let output_callback = move |line: String| {
             queue_clone.append_output(task_id, line);
         };
 
         match task.task_type {
-            TaskType::Install => {
-                ParuBackend::install_package(&task.package_name, output_callback)
-            }
-            TaskType::Remove => {
-                ParuBackend::remove_package(&task.package_name, output_callback)
-            }
-            TaskType::Update => {
-                ParuBackend::update_system(output_callback)
-            }
-            TaskType::CleanCache => {
-                ParuBackend::clean_cache(output_callback)
-            }
-            TaskType::RemoveOrphans => {
-                ParuBackend::remove_orphans(output_callback)
-            }
+            TaskType::Install => ParuBackend::install_package(&task.package_name, output_callback),
+            TaskType::Remove => ParuBackend::remove_package(&task.package_name, output_callback),
+            TaskType::Update => ParuBackend::update_system(output_callback),
+            TaskType::CleanCache => ParuBackend::clean_cache(output_callback),
+            TaskType::RemoveOrphans => ParuBackend::remove_orphans(output_callback),
         }
+        .inspect(|_| {
+            if settings::get().notify_on_task_complete {
+                utils::send_notification(
+                    "Parut Task Completed",
+                    &format!("{:?} {}", task.task_type, task.package_name),
+                );
+            }
+        })
+        .inspect_err(|err| {
+            if settings::get().notify_on_task_failed {
+                utils::send_notification(
+                    "Parut Task Failed",
+                    &format!("{:?} {}: {}", task.task_type, task.package_name, err),
+                );
+            }
+        })
     }
 }

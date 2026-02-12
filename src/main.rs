@@ -1,67 +1,76 @@
-use gtk4::prelude::*;
-use gtk4::{glib, gdk, CssProvider};
 use adw::prelude::*;
 use adw::{Application, ApplicationWindow, StyleManager};
+use gtk4::{CssProvider, gdk, glib};
 
-mod ui;
-mod paru;
-mod task_queue;
 mod logger;
-mod utils;
+mod paru;
 mod settings;
+mod task_queue;
+mod ui;
+mod utils;
 
-use ui::ParuGui;
 use logger::log_info;
+use ui::ParuGui;
 
-const APP_ID: &str = "com.example.Parut";
+const APP_ID: &str = "io.github.reubenpercival.parut";
 const CSS: &str = include_str!("style.css");
 
 fn main() -> glib::ExitCode {
     // Log application start
     log_info("Parut application starting");
-    
+
     // Initialize settings
     settings::init();
-    
-    let app = Application::builder()
-        .application_id(APP_ID)
-        .build();
+
+    let app = Application::builder().application_id(APP_ID).build();
 
     app.connect_startup(|_| {
         // Use system color scheme
-        let _style_manager = StyleManager::default();
+        let style_manager = StyleManager::default();
+        match crate::settings::get().theme.as_str() {
+            "light" => style_manager.set_color_scheme(adw::ColorScheme::ForceLight),
+            "dark" => style_manager.set_color_scheme(adw::ColorScheme::ForceDark),
+            _ => style_manager.set_color_scheme(adw::ColorScheme::Default),
+        }
 
-        
         // Load custom CSS
         load_css();
     });
 
     app.connect_activate(build_ui);
-    
+
     let exit_code = app.run();
-    
+
     // Log application exit
-    log_info(&format!("Parut application exiting with code: {:?}", exit_code));
-    
+    log_info(&format!(
+        "Parut application exiting with code: {:?}",
+        exit_code
+    ));
+
     exit_code
 }
 
 fn load_css() {
+    let Some(display) = gdk::Display::default() else {
+        log_info("No display available, skipping CSS provider registration");
+        return;
+    };
+
     let provider = CssProvider::new();
     provider.load_from_data(CSS);
-    
+
     gtk4::style_context_add_provider_for_display(
-        &gdk::Display::default().expect("Could not get default display"),
+        &display,
         &provider,
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
-    
+
     log_info("Custom CSS loaded successfully");
 }
 
 fn build_ui(app: &Application) {
     log_info("Building UI");
-    
+
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Parut")
@@ -79,6 +88,6 @@ fn build_ui(app: &Application) {
     window.set_content(Some(gui.main_widget()));
 
     window.present();
-    
+
     log_info("UI presented successfully");
 }

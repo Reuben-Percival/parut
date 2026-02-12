@@ -1,7 +1,7 @@
-use std::process::{Command, Stdio};
-use std::io::{BufRead, BufReader};
+use crate::logger::{log_debug, log_error, log_info, log_warning};
+use crate::settings;
 use std::collections::{HashMap, HashSet};
-use crate::logger::{log_info, log_error, log_warning, log_debug};
+use std::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct Package {
@@ -36,31 +36,33 @@ pub struct PackageDetails {
     pub validated_by: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct NewsItem {
+    pub title: String,
+    pub link: String,
+    pub published: String,
+}
+
 pub struct ParuBackend;
 
 impl ParuBackend {
     pub fn is_paru_installed() -> bool {
-        Command::new("which")
-        .arg("paru")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        Self::command_exists("paru")
     }
 
     // UPDATED: Added limit parameter for performance
-    pub fn search_packages(query: &str, limit: Option<usize>) ->
-    Result<Vec<Package>, String> {
+    pub fn search_packages(query: &str, limit: Option<usize>) -> Result<Vec<Package>, String> {
         log_debug(&format!("Searching packages with query: {}", query));
 
         let output = Command::new("paru")
-        .arg("-Ss")
-        .arg(query)
-        .output()
-        .map_err(|e| {
-            let err = format!("Failed to execute paru: {}", e);
-            log_error(&err);
-            err
-        })?;
+            .arg("-Ss")
+            .arg(query)
+            .output()
+            .map_err(|e| {
+                let err = format!("Failed to execute paru: {}", e);
+                log_error(&err);
+                err
+            })?;
 
         if !output.status.success() {
             log_error("Paru search failed");
@@ -77,18 +79,17 @@ impl ParuBackend {
             }
         }
 
-        log_info(&format!("Search completed: found {} packages",
-                          packages.len()));
+        log_info(&format!(
+            "Search completed: found {} packages",
+            packages.len()
+        ));
         Ok(packages)
     }
 
     pub fn list_installed() -> Result<Vec<Package>, String> {
         log_debug("Listing installed packages");
 
-        let output = Command::new("pacman")
-        .arg("-Q")
-        .output()
-        .map_err(|e| {
+        let output = Command::new("pacman").arg("-Q").output().map_err(|e| {
             let err = format!("Failed to execute pacman: {}", e);
             log_error(&err);
             err
@@ -102,9 +103,7 @@ impl ParuBackend {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut packages = Self::parse_installed_output(&stdout);
 
-        let foreign_output = Command::new("pacman")
-        .arg("-Qm")
-        .output();
+        let foreign_output = Command::new("pacman").arg("-Qm").output();
 
         let mut foreign_set = HashSet::new();
         if let Ok(output) = foreign_output {
@@ -126,8 +125,11 @@ impl ParuBackend {
             }
         }
 
-        log_info(&format!("Listed {} installed packages ({} from AUR)",
-                          packages.len(), foreign_set.len()));
+        log_info(&format!(
+            "Listed {} installed packages ({} from AUR)",
+            packages.len(),
+            foreign_set.len()
+        ));
         Ok(packages)
     }
 
@@ -139,11 +141,7 @@ impl ParuBackend {
 
         // 1. Try to get official repo updates via checkupdates (safely syncs DB)
         // If checkupdates is missing, we rely on paru -Qu (local DB only)
-        let use_checkupdates = Command::new("which")
-            .arg("checkupdates")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let use_checkupdates = Self::command_exists("checkupdates");
 
         if use_checkupdates {
             log_info("Using checkupdates for repo updates");
@@ -160,14 +158,14 @@ impl ParuBackend {
                 }
                 Err(e) => log_error(&format!("checkupdates failed: {}", e)),
             }
-        } 
+        }
 
         // 2. Get AUR updates (or all if checkupdates failed/missing) via paru
         // -Qu: Upgradeable
         // -a: AUR only (if we used checkupdates), otherwise omit -a to get all
         let mut cmd = Command::new("paru");
         cmd.arg("-Qu").arg("--noconfirm"); // Non-interactive
-        
+
         // If we successfully used checkupdates, we only need AUR from paru
         if use_checkupdates {
             cmd.arg("-a");
@@ -178,8 +176,11 @@ impl ParuBackend {
                 // paru returns 1 if no updates found, which is not an error for us
                 if output.status.success() || output.status.code() == Some(1) {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    let updates = Self::parse_update_lines(&stdout, if use_checkupdates { "aur" } else { "unknown" });
-                    
+                    let updates = Self::parse_update_lines(
+                        &stdout,
+                        if use_checkupdates { "aur" } else { "unknown" },
+                    );
+
                     for pkg in updates {
                         if !seen_packages.contains(&pkg.name) {
                             seen_packages.insert(pkg.name.clone());
@@ -193,30 +194,31 @@ impl ParuBackend {
             }
             Err(e) => log_error(&format!("Failed to execute paru: {}", e)),
         }
-        
+
         // If we didn't use checkupdates, we need to identify repos
         if !use_checkupdates && !packages.is_empty() {
-             let foreign_set = Self::get_foreign_packages();
-             let package_names: Vec<&str> = packages.iter()
+            let foreign_set = Self::get_foreign_packages();
+            let package_names: Vec<&str> = packages
+                .iter()
                 .filter(|p| !foreign_set.contains(&p.name))
                 .map(|p| p.name.as_str())
                 .collect();
-                
-             let repo_map = if !package_names.is_empty() {
+
+            let repo_map = if !package_names.is_empty() {
                 Self::get_repos_batch(&package_names)
-             } else {
+            } else {
                 HashMap::new()
-             };
-             
-             for pkg in &mut packages {
-                 if foreign_set.contains(&pkg.name) {
-                     pkg.repository = "aur".to_string();
-                 } else if let Some(repo) = repo_map.get(&pkg.name) {
-                     pkg.repository = repo.clone();
-                 } else {
-                     pkg.repository = "core".to_string(); // Fallback assumption
-                 }
-             }
+            };
+
+            for pkg in &mut packages {
+                if foreign_set.contains(&pkg.name) {
+                    pkg.repository = "aur".to_string();
+                } else if let Some(repo) = repo_map.get(&pkg.name) {
+                    pkg.repository = repo.clone();
+                } else {
+                    pkg.repository = "core".to_string(); // Fallback assumption
+                }
+            }
         }
 
         log_info(&format!("Found {} available updates", packages.len()));
@@ -224,13 +226,14 @@ impl ParuBackend {
     }
 
     fn parse_update_lines(output: &str, default_repo: &str) -> Vec<Package> {
-         output.lines()
+        output
+            .lines()
             .filter_map(|line| {
                 // Format: name old -> new
                 // Filter out "[ignored]" or other noise
                 let clean_line = line.replace("[ignored]", "").trim().to_string();
                 let parts: Vec<&str> = clean_line.split_whitespace().collect();
-                
+
                 if parts.len() >= 4 {
                     // parts[0] might be 'repo/name' or just 'name'
                     let raw_name = parts[0];
@@ -255,10 +258,7 @@ impl ParuBackend {
     }
 
     pub fn is_aur_package(name: &str) -> bool {
-        let output = Command::new("pacman")
-        .arg("-Si")
-        .arg(name)
-        .output();
+        let output = Command::new("pacman").arg("-Si").arg(name).output();
 
         if let Ok(output) = output {
             if output.status.success() {
@@ -273,14 +273,14 @@ impl ParuBackend {
         log_debug(&format!("Fetching PKGBUILD for package: {}", package_name));
 
         let output = Command::new("paru")
-        .arg("-Gp")
-        .arg(package_name)
-        .output()
-        .map_err(|e| {
-            let err = format!("Failed to fetch PKGBUILD: {}", e);
-            log_error(&err);
-            err
-        })?;
+            .arg("-Gp")
+            .arg(package_name)
+            .output()
+            .map_err(|e| {
+                let err = format!("Failed to fetch PKGBUILD: {}", e);
+                log_error(&err);
+                err
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -297,55 +297,47 @@ impl ParuBackend {
             return Err(err);
         }
 
-        log_info(&format!("Successfully fetched PKGBUILD for package: {}",
-                          package_name));
+        log_info(&format!(
+            "Successfully fetched PKGBUILD for package: {}",
+            package_name
+        ));
         Ok(pkgbuild)
     }
 
-    pub fn install_package<F>(name: &str, output_callback: F) -> Result<(),
-    String>
+    pub fn install_package<F>(name: &str, output_callback: F) -> Result<(), String>
     where
-    F: Fn(String) + Send + 'static,
+        F: Fn(String) + Send + Sync + 'static,
     {
         log_info(&format!("Starting installation of package: {}", name));
-
-        let is_aur = Self::is_aur_package(name);
-        log_debug(&format!("Package {} is from: {}", name, if is_aur { "AUR" }
-        else { "official repos" }));
-
-        let result = if is_aur {
-            Self::run_paru_without_root(&["-S", "--noconfirm", name],
-                                        output_callback)
-        } else {
-            Self::run_paru_with_output(&["-S", "--noconfirm", name],
-                                       output_callback)
-        };
+        let result = Self::run_paru_in_terminal(&["-S", "--noconfirm", name], output_callback);
 
         match &result {
-            Ok(_) => log_info(&format!("Successfully installed package: {}",
-                                       name)),
-                                       Err(e) => log_error(&format!("Failed to
-                                       install package {}: {}", name, e)),
+            Ok(_) => log_info(&format!("Successfully installed package: {}", name)),
+            Err(e) => log_error(&format!(
+                "Failed to
+                                       install package {}: {}",
+                name, e
+            )),
         }
 
         result
     }
 
-    pub fn remove_package<F>(name: &str, output_callback: F) -> Result<(),
-    String>
+    pub fn remove_package<F>(name: &str, output_callback: F) -> Result<(), String>
     where
-    F: Fn(String) + Send + 'static,
+        F: Fn(String) + Send + Sync + 'static,
     {
         log_info(&format!("Starting removal of package: {}", name));
 
-        let result = Self::run_paru_with_output(&["-Rns", "--noconfirm", name],
-                                                output_callback);
+        let result = Self::run_paru_in_terminal(&["-Rns", "--noconfirm", name], output_callback);
 
         match &result {
-            Ok(_) => log_info(&format!("Successfully removed package: {}",
-                                       name)),
-                                       Err(e) => log_error(&format!("Failed to
-                                       remove package {}: {}", name, e)),
+            Ok(_) => log_info(&format!("Successfully removed package: {}", name)),
+            Err(e) => log_error(&format!(
+                "Failed to
+                                       remove package {}: {}",
+                name, e
+            )),
         }
 
         result
@@ -353,12 +345,11 @@ impl ParuBackend {
 
     pub fn update_system<F>(output_callback: F) -> Result<(), String>
     where
-    F: Fn(String) + Send + 'static,
+        F: Fn(String) + Send + Sync + 'static,
     {
         log_info("Starting system update");
 
-        let result = Self::run_paru_without_root(&["-Syu", "--noconfirm"],
-                                                 output_callback);
+        let result = Self::run_paru_in_terminal(&["-Syu", "--noconfirm"], output_callback);
 
         match &result {
             Ok(_) => log_info("System update completed successfully"),
@@ -370,13 +361,12 @@ impl ParuBackend {
 
     pub fn clean_cache<F>(output_callback: F) -> Result<(), String>
     where
-    F: Fn(String) + Send + 'static,
+        F: Fn(String) + Send + Sync + 'static,
     {
         log_info("Starting cache cleanup");
 
         // -Sc removes uninstalled packages from cache
-        let result = Self::run_paru_without_root(&["-Sc", "--noconfirm"],
-                                                 output_callback);
+        let result = Self::run_paru_in_terminal(&["-Sc", "--noconfirm"], output_callback);
 
         match &result {
             Ok(_) => log_info("Cache cleanup completed successfully"),
@@ -386,17 +376,14 @@ impl ParuBackend {
         result
     }
 
-
-
     pub fn remove_orphans<F>(output_callback: F) -> Result<(), String>
     where
-    F: Fn(String) + Send + 'static,
+        F: Fn(String) + Send + Sync + 'static,
     {
         log_info("Starting orphan removal");
 
         // -c removes orphans (recursive)
-        let result = Self::run_paru_without_root(&["-c", "--noconfirm"],
-                                                 output_callback);
+        let result = Self::run_paru_in_terminal(&["-c", "--noconfirm"], output_callback);
 
         match &result {
             Ok(_) => log_info("Orphan removal completed successfully"),
@@ -408,10 +395,10 @@ impl ParuBackend {
 
     pub fn get_package_details(name: &str) -> Result<PackageDetails, String> {
         let is_installed = Self::is_package_installed(name);
-        
+
         // Use -Qi for installed, -Si for sync/aur
         let flag = if is_installed { "-Qi" } else { "-Si" };
-        
+
         let output = Command::new("paru")
             .arg(flag)
             .arg(name)
@@ -424,6 +411,55 @@ impl ParuBackend {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         Self::parse_package_details(&stdout, name)
+    }
+
+    pub fn fetch_arch_news(limit: usize) -> Result<Vec<NewsItem>, String> {
+        let item_limit = limit.max(1);
+        let output = Command::new("curl")
+            .arg("-fsSL")
+            .arg("https://archlinux.org/feeds/news/")
+            .output()
+            .map_err(|e| format!("Failed to execute curl: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Failed to fetch Arch news feed: {}", stderr.trim()));
+        }
+
+        let xml = String::from_utf8_lossy(&output.stdout);
+        let mut items = Vec::new();
+        for chunk in xml.split("<item>").skip(1) {
+            let Some(end) = chunk.find("</item>") else {
+                continue;
+            };
+            let item_xml = &chunk[..end];
+            let title = Self::decode_html_entities(
+                &Self::extract_xml_tag(item_xml, "title").unwrap_or_default(),
+            );
+            let link = Self::extract_xml_tag(item_xml, "link").unwrap_or_default();
+            let published = Self::decode_html_entities(
+                &Self::extract_xml_tag(item_xml, "pubDate").unwrap_or_default(),
+            );
+
+            if title.is_empty() || link.is_empty() {
+                continue;
+            }
+
+            items.push(NewsItem {
+                title,
+                link,
+                published,
+            });
+
+            if items.len() >= item_limit {
+                break;
+            }
+        }
+
+        if items.is_empty() {
+            return Err("No news items were found in the feed".to_string());
+        }
+        Ok(items)
     }
 
     fn is_package_installed(name: &str) -> bool {
@@ -493,116 +529,102 @@ impl ParuBackend {
         Ok(details)
     }
 
-    fn run_paru_with_output<F>(args: &[&str], output_callback: F) -> Result<(),
-    String>
-    where
-    F: Fn(String) + Send + 'static,
-    {
-        let mut cmd = Command::new("pkexec");
-        cmd.arg("paru");
-        for arg in args {
-            cmd.arg(arg);
-        }
-
-        cmd.stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-        let mut child = cmd.spawn()
-        .map_err(|e| format!("Failed to spawn paru: {}. Make sure pkexec is
-        installed.", e))?;
-
-        if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    output_callback(line);
-                }
-            }
-        }
-
-        if let Some(stderr) = child.stderr.take() {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    output_callback(format!("ERROR: {}", line));
-                }
-            }
-        }
-
-        let status = child.wait()
-        .map_err(|e| format!("Failed to wait for paru: {}", e))?;
-
-        if status.success() {
-            Ok(())
-        } else {
-            Err("Operation failed".to_string())
-        }
+    fn extract_xml_tag(input: &str, tag: &str) -> Option<String> {
+        let open = format!("<{}>", tag);
+        let close = format!("</{}>", tag);
+        let start = input.find(&open)?;
+        let after_open = start + open.len();
+        let end_rel = input[after_open..].find(&close)?;
+        Some(input[after_open..after_open + end_rel].trim().to_string())
     }
 
-    fn run_paru_without_root<F>(args: &[&str], output_callback: F) ->
-    Result<(), String>
+    fn decode_html_entities(input: &str) -> String {
+        input
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+    }
+
+    fn run_paru_in_terminal<F>(args: &[&str], output_callback: F) -> Result<(), String>
     where
-    F: Fn(String) + Send + 'static,
+        F: Fn(String) + Send + Sync + 'static,
     {
-        let paru_cmd = format!("paru {}", args.join(" "));
-
-        let terminals = [
-            ("gnome-terminal", vec!["--", "bash", "-c"]),
-            ("konsole", vec!["-e", "bash", "-c"]),
-            ("xterm", vec!["-e", "bash", "-c"]),
-            ("xfce4-terminal", vec!["-e", "bash", "-c"]),
-            ("alacritty", vec!["-e", "bash", "-c"]),
+        let preferred = settings::get().terminal_preference;
+        let mut terminals = vec![
+            "gnome-terminal".to_string(),
+            "konsole".to_string(),
+            "xterm".to_string(),
+            "xfce4-terminal".to_string(),
+            "alacritty".to_string(),
         ];
-
-        let terminal_found = false;
+        if preferred != "auto" {
+            terminals.retain(|t| *t != preferred);
+            terminals.insert(0, preferred);
+        }
+        let mut terminal_found = false;
         let mut last_error = String::new();
 
-        for (terminal, mut args_prefix) in terminals {
-            if Command::new("which").arg(terminal).output().map(|o|
-                o.status.success()).unwrap_or(false) {
-                    output_callback(format!("Running: {} {}", terminal,
-                                            paru_cmd));
+        for terminal in terminals {
+            if !Self::command_exists(&terminal) {
+                continue;
+            }
+            terminal_found = true;
 
-                    // The terminal will close automatically upon completion
-                    let full_cmd = paru_cmd.clone();
-                    args_prefix.push(&full_cmd);
-
-                    let mut cmd = Command::new(terminal);
-                    for arg in &args_prefix {
-                        cmd.arg(arg);
-                    }
-
-                    match cmd.spawn() {
-                        Ok(mut child) => {
-                            output_callback("Terminal opened - waiting for
-                            completion...".to_string());
-
-                            let status = child.wait()
-                            .map_err(|e| format!("Failed to wait for terminal:
-                            {}", e))?;
-
-                            if status.success() {
-                                return Ok(());
-                            } else {
-                                return Err("Operation failed - check terminal
-                                output".to_string());
-                            }
-                        }
-                        Err(e) => {
-                            last_error = format!("Failed to spawn {}: {}",
-                                                 terminal, e);
-                            continue;
-                        }
-                    }
+            let mut cmd = Command::new(&terminal);
+            match terminal.as_str() {
+                "gnome-terminal" => {
+                    cmd.arg("--").arg("paru").args(args);
                 }
+                "konsole" | "xterm" | "xfce4-terminal" | "alacritty" => {
+                    cmd.arg("-e").arg("paru").args(args);
+                }
+                _ => {}
+            }
+
+            output_callback(format!(
+                "Running in terminal: {} paru {}",
+                terminal,
+                args.join(" ")
+            ));
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    output_callback("Terminal opened - waiting for completion...".to_string());
+                    let status = child
+                        .wait()
+                        .map_err(|e| format!("Failed to wait for terminal: {}", e))?;
+
+                    if status.success() {
+                        return Ok(());
+                    }
+
+                    return Err("Operation failed - check terminal output".to_string());
+                }
+                Err(e) => {
+                    last_error = format!("Failed to spawn {}: {}", terminal, e);
+                }
+            }
         }
 
         if !terminal_found {
-            Err(format!("No terminal emulator found. Last error: {}",
-                        last_error))
+            Err(format!(
+                "No terminal emulator found. Last error: {}",
+                last_error
+            ))
         } else {
             Err(last_error)
         }
+    }
+
+    fn command_exists(binary: &str) -> bool {
+        std::env::var_os("PATH")
+            .map(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|p| p.join(binary))
+                    .any(|full| full.is_file())
+            })
+            .unwrap_or(false)
     }
 
     fn parse_search_output(output: &str) -> Vec<Package> {
@@ -618,8 +640,27 @@ impl ParuBackend {
                 continue;
             }
 
-            if let Some((repo_name, version)) = line.split_once(' ') {
-                if let Some((repository, name)) = repo_name.split_once('/') {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Some((repository, name)) = parts[0].split_once('/') {
+                    let clean_version = parts[1].to_string();
+                    let installed_version = if line.contains("[installed:") {
+                        let start = line
+                            .find("[installed:")
+                            .map(|idx| idx + "[installed:".len());
+                        let end = line[start.unwrap_or(0)..]
+                            .find(']')
+                            .map(|idx| idx + start.unwrap_or(0));
+                        match (start, end) {
+                            (Some(s), Some(e)) if s < e => Some(line[s..e].trim().to_string()),
+                            _ => Some(clean_version.clone()),
+                        }
+                    } else if line.contains("[installed]") {
+                        Some(clean_version.clone())
+                    } else {
+                        None
+                    };
+
                     let description = if i + 1 < lines.len() {
                         lines[i + 1].trim().to_string()
                     } else {
@@ -628,10 +669,10 @@ impl ParuBackend {
 
                     packages.push(Package {
                         name: name.to_string(),
-                                  version: version.to_string(),
-                                  description,
-                                  repository: repository.to_string(),
-                                  installed_version: None,
+                        version: clean_version,
+                        description,
+                        repository: repository.to_string(),
+                        installed_version,
                     });
 
                     i += 2;
@@ -647,80 +688,22 @@ impl ParuBackend {
 
     fn parse_installed_output(output: &str) -> Vec<Package> {
         output
-        .lines()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                Some(Package {
-                    name: parts[0].to_string(),
-                     version: parts[1].to_string(),
-                     description: String::new(),
-                     repository: "unknown".to_string(),
-                     installed_version: Some(parts[1].to_string()),
-                })
-            } else {
-                None
-            }
-        })
-        .collect()
-    }
-
-    fn parse_updates_output_optimized(output: &str) -> Vec<Package> {
-        let updates: Vec<(String, String, String)> = output
-        .lines()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                Some((
-                    parts[0].to_string(),
-                      parts[1].to_string(),
-                      parts[3].to_string(),
-                ))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-        if updates.is_empty() {
-            return Vec::new();
-        }
-
-        let foreign_set = Self::get_foreign_packages();
-
-        let package_names: Vec<&str> = updates
-        .iter()
-        .filter(|(name, _, _)| !foreign_set.contains(name))
-        .map(|(name, _, _)| name.as_str())
-        .collect();
-
-        let repo_map = if !package_names.is_empty() {
-            Self::get_repos_batch(&package_names)
-        } else {
-            HashMap::new()
-        };
-
-        updates
-        .into_iter()
-        .map(|(name, old_version, new_version)| {
-            let repository = if foreign_set.contains(&name) {
-                "aur".to_string()
-            } else {
-                repo_map
-                .get(&name)
-                .cloned()
-                .unwrap_or_else(|| "core".to_string())
-            };
-
-            Package {
-                name,
-                version: new_version,
-                description: String::new(),
-             repository,
-             installed_version: Some(old_version),
-            }
-        })
-        .collect()
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    Some(Package {
+                        name: parts[0].to_string(),
+                        version: parts[1].to_string(),
+                        description: String::new(),
+                        repository: "unknown".to_string(),
+                        installed_version: Some(parts[1].to_string()),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn get_foreign_packages() -> HashSet<String> {
@@ -763,13 +746,14 @@ impl ParuBackend {
                 for line in stdout.lines() {
                     if line.starts_with("Name") {
                         if let (Some(pkg), Some(repo)) =
-                            (current_package.take(), current_repo.take()) {
-                                repo_map.insert(pkg, repo);
-                            }
+                            (current_package.take(), current_repo.take())
+                        {
+                            repo_map.insert(pkg, repo);
+                        }
 
-                            if let Some(name) = line.split(':').nth(1) {
-                                current_package = Some(name.trim().to_string());
-                            }
+                        if let Some(name) = line.split(':').nth(1) {
+                            current_package = Some(name.trim().to_string());
+                        }
                     } else if line.starts_with("Repository") {
                         if let Some(repo) = line.split(':').nth(1) {
                             current_repo = Some(repo.trim().to_string());
@@ -777,10 +761,9 @@ impl ParuBackend {
                     }
                 }
 
-                if let (Some(pkg), Some(repo)) = (current_package,
-                    current_repo) {
+                if let (Some(pkg), Some(repo)) = (current_package, current_repo) {
                     repo_map.insert(pkg, repo);
-                    }
+                }
             }
         }
 
@@ -788,8 +771,7 @@ impl ParuBackend {
     }
 
     #[allow(dead_code)]
-    fn get_package_repositories(package_names: &[String]) -> HashMap<String,
-    String> {
+    fn get_package_repositories(package_names: &[String]) -> HashMap<String, String> {
         let mut repo_map = HashMap::new();
         let foreign_packages = Self::get_foreign_packages();
 
@@ -797,10 +779,7 @@ impl ParuBackend {
             if foreign_packages.contains(package_name) {
                 repo_map.insert(package_name.clone(), "aur".to_string());
             } else {
-                let output = Command::new("pacman")
-                .arg("-Si")
-                .arg(package_name)
-                .output();
+                let output = Command::new("pacman").arg("-Si").arg(package_name).output();
 
                 if let Ok(output) = output {
                     if output.status.success() {
@@ -808,8 +787,7 @@ impl ParuBackend {
                         for line in stdout.lines() {
                             if line.starts_with("Repository") {
                                 if let Some(repo) = line.split(':').nth(1) {
-                                    repo_map.insert(package_name.clone(),
-                                                    repo.trim().to_string());
+                                    repo_map.insert(package_name.clone(), repo.trim().to_string());
                                     break;
                                 }
                             }
@@ -817,8 +795,9 @@ impl ParuBackend {
                     }
                 }
 
-                repo_map.entry(package_name.clone()).or_insert_with(||
-                "unknown".to_string());
+                repo_map
+                    .entry(package_name.clone())
+                    .or_insert_with(|| "unknown".to_string());
             }
         }
 
@@ -828,13 +807,13 @@ impl ParuBackend {
     #[allow(dead_code)]
     fn parse_updates_output(output: &str) -> Vec<Package> {
         let package_names: Vec<String> = output
-        .lines()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                Some(parts[0].to_string())
-            } else {
-                None
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 4 {
+                    Some(parts[0].to_string())
+                } else {
+                    None
                 }
             })
             .collect();
@@ -847,7 +826,8 @@ impl ParuBackend {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 4 {
                     let package_name = parts[0].to_string();
-                    let repository = repo_map.get(&package_name)
+                    let repository = repo_map
+                        .get(&package_name)
                         .cloned()
                         .unwrap_or_else(|| "unknown".to_string());
 
@@ -863,5 +843,54 @@ impl ParuBackend {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ParuBackend;
+
+    #[test]
+    fn parses_update_lines_with_repo_prefix() {
+        let input = "core/linux 6.12.1 -> 6.12.2\nparu 2.0.0 -> 2.1.0";
+        let updates = ParuBackend::parse_update_lines(input, "unknown");
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].name, "linux");
+        assert_eq!(updates[0].repository, "core");
+        assert_eq!(updates[0].installed_version.as_deref(), Some("6.12.1"));
+        assert_eq!(updates[0].version, "6.12.2");
+        assert_eq!(updates[1].name, "paru");
+        assert_eq!(updates[1].repository, "unknown");
+    }
+
+    #[test]
+    fn parses_search_output_pairs() {
+        let input = "extra/ripgrep 14.1.0-1\n    A fast line-oriented search tool\naur/parut-git 0.2.0-1\n    GUI for paru";
+        let pkgs = ParuBackend::parse_search_output(input);
+        assert_eq!(pkgs.len(), 2);
+        assert_eq!(pkgs[0].name, "ripgrep");
+        assert_eq!(pkgs[0].repository, "extra");
+        assert_eq!(pkgs[0].description, "A fast line-oriented search tool");
+        assert_eq!(pkgs[1].name, "parut-git");
+        assert_eq!(pkgs[1].repository, "aur");
+    }
+
+    #[test]
+    fn parses_installed_output_lines() {
+        let input = "gtk4 1:4.16.12-1\nparu 2.1.0-1";
+        let installed = ParuBackend::parse_installed_output(input);
+        assert_eq!(installed.len(), 2);
+        assert_eq!(installed[0].name, "gtk4");
+        assert_eq!(
+            installed[0].installed_version.as_deref(),
+            Some("1:4.16.12-1")
+        );
+    }
+
+    #[test]
+    fn extracts_xml_tag_value() {
+        let input = "<item><title>Arch News</title></item>";
+        let title = ParuBackend::extract_xml_tag(input, "title");
+        assert_eq!(title.as_deref(), Some("Arch News"));
     }
 }

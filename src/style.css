@@ -65,3 +65,30 @@
     font-family: monospace;
     font-size: 11px;
 }
+
+/* Settings dialog polish */
+.settings-dialog {
+    background-color: @window_bg_color;
+}
+
+.settings-page {
+    background: transparent;
+}
+
+.settings-group {
+    margin-bottom: 10px;
+}
+
+.settings-row {
+    border-radius: 10px;
+    transition: background-color 180ms ease;
+}
+
+.settings-row:hover {
+    background-color: alpha(@accent_bg_color, 0.07);
+}
+
+.settings-switch {
+    min-width: 48px;
+    min-height: 28px;
+}

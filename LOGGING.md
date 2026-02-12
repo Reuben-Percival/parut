@@ -8,12 +8,12 @@ Parut now includes a comprehensive logging system that tracks all application op
 
 All logs are stored in:
 ```
-~/.parut/parut.log
+~/.local/share/parut/parut.log
 ```
 
 For example, if your username is "terra", the log file will be at:
 ```
-/home/terra/.parut/parut.log
+/home/terra/.local/share/parut/parut.log
 ```
 
 ## What Gets Logged
@@ -71,19 +71,19 @@ You can view the logs in real-time using:
 
 ```bash
 # View entire log
-cat ~/.parut/parut.log
+cat ~/.local/share/parut/parut.log
 
 # View last 20 lines
-tail -n 20 ~/.parut/parut.log
+tail -n 20 ~/.local/share/parut/parut.log
 
 # Follow log in real-time (watch as things happen)
-tail -f ~/.parut/parut.log
+tail -f ~/.local/share/parut/parut.log
 
 # View only errors
-grep ERROR ~/.parut/parut.log
+grep ERROR ~/.local/share/parut/parut.log
 
 # View logs from today
-grep "$(date +%Y-%m-%d)" ~/.parut/parut.log
+grep "$(date +%Y-%m-%d)" ~/.local/share/parut/parut.log
 ```
 
 ## Log Rotation
@@ -92,17 +92,17 @@ The log file will grow over time. You can manually clear it if needed:
 
 ```bash
 # Clear the log file
-> ~/.parut/parut.log
+> ~/.local/share/parut/parut.log
 
 # Or delete it (will be recreated on next app start)
-rm ~/.parut/parut.log
+rm ~/.local/share/parut/parut.log
 ```
 
 Consider setting up logrotate or a simple cron job if you want automatic log management:
 
 ```bash
 # Add to crontab (monthly cleanup)
-0 0 1 * * truncate -s 0 ~/.parut/parut.log
+0 0 1 * * truncate -s 0 ~/.local/share/parut/parut.log
 ```
 
 ## Privacy Notes

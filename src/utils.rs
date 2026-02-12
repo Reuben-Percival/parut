@@ -1,6 +1,5 @@
-
+use crate::logger::{log_error, log_info};
 use std::process::Command;
-use crate::logger::{log_info, log_error};
 
 pub fn send_notification(title: &str, body: &str) {
     if is_notify_send_available() {
@@ -12,14 +11,19 @@ pub fn send_notification(title: &str, body: &str) {
             .spawn()
             .map_err(|e| log_error(&format!("Failed to send notification: {}", e)));
     } else {
-        log_info(&format!("Notification skipped (notify-send not found): {}: {}", title, body));
+        log_info(&format!(
+            "Notification skipped (notify-send not found): {}: {}",
+            title, body
+        ));
     }
 }
 
 fn is_notify_send_available() -> bool {
-    Command::new("which")
-        .arg("notify-send")
-        .output()
-        .map(|o| o.status.success())
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .map(|p| p.join("notify-send"))
+                .any(|full| full.is_file())
+        })
         .unwrap_or(false)
 }
