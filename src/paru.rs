@@ -83,9 +83,10 @@ impl ParuBackend {
 
         // Truncate results if a limit is specified
         if let Some(l) = limit
-            && packages.len() > l {
-                packages.truncate(l);
-            }
+            && packages.len() > l
+        {
+            packages.truncate(l);
+        }
 
         log_info(&format!(
             "Search completed: found {} packages",
@@ -120,21 +121,23 @@ impl ParuBackend {
         // This is much faster than individual calls
         let mut descriptions = HashMap::new();
         if let Ok(details_output) = Command::new("pacman").env("LANG", "C").arg("-Qi").output()
-            && details_output.status.success() {
-                let details_stdout = String::from_utf8_lossy(&details_output.stdout);
-                let mut current_name = String::new();
-                for line in details_stdout.lines() {
-                    if line.starts_with("Name") {
-                        if let Some(name) = line.split(':').nth(1) {
-                            current_name = name.trim().to_string();
-                        }
-                    } else if line.starts_with("Description")
-                        && let Some(desc) = line.split(':').nth(1)
-                            && !current_name.is_empty() {
-                                descriptions.insert(current_name.clone(), desc.trim().to_string());
-                            }
+            && details_output.status.success()
+        {
+            let details_stdout = String::from_utf8_lossy(&details_output.stdout);
+            let mut current_name = String::new();
+            for line in details_stdout.lines() {
+                if line.starts_with("Name") {
+                    if let Some(name) = line.split(':').nth(1) {
+                        current_name = name.trim().to_string();
+                    }
+                } else if line.starts_with("Description")
+                    && let Some(desc) = line.split(':').nth(1)
+                    && !current_name.is_empty()
+                {
+                    descriptions.insert(current_name.clone(), desc.trim().to_string());
                 }
             }
+        }
 
         // 3. Get foreign packages
         let foreign_set = Self::get_foreign_packages();
@@ -288,9 +291,10 @@ impl ParuBackend {
         let output = Command::new("pacman").arg("-Si").arg(name).output();
 
         if let Ok(output) = output
-            && output.status.success() {
-                return false;
-            }
+            && output.status.success()
+        {
+            return false;
+        }
 
         true
     }
@@ -807,42 +811,43 @@ impl ParuBackend {
 
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2
-                && let Some((repository, name)) = parts[0].split_once('/') {
-                    let clean_version = parts[1].to_string();
-                    let installed_version = if line.contains("[installed:") {
-                        let start = line
-                            .find("[installed:")
-                            .map(|idx| idx + "[installed:".len());
-                        let end = line[start.unwrap_or(0)..]
-                            .find(']')
-                            .map(|idx| idx + start.unwrap_or(0));
-                        match (start, end) {
-                            (Some(s), Some(e)) if s < e => Some(line[s..e].trim().to_string()),
-                            _ => Some(clean_version.clone()),
-                        }
-                    } else if line.contains("[installed]") {
-                        Some(clean_version.clone())
-                    } else {
-                        None
-                    };
+                && let Some((repository, name)) = parts[0].split_once('/')
+            {
+                let clean_version = parts[1].to_string();
+                let installed_version = if line.contains("[installed:") {
+                    let start = line
+                        .find("[installed:")
+                        .map(|idx| idx + "[installed:".len());
+                    let end = line[start.unwrap_or(0)..]
+                        .find(']')
+                        .map(|idx| idx + start.unwrap_or(0));
+                    match (start, end) {
+                        (Some(s), Some(e)) if s < e => Some(line[s..e].trim().to_string()),
+                        _ => Some(clean_version.clone()),
+                    }
+                } else if line.contains("[installed]") {
+                    Some(clean_version.clone())
+                } else {
+                    None
+                };
 
-                    let description = if i + 1 < lines.len() {
-                        lines[i + 1].trim().to_string()
-                    } else {
-                        String::new()
-                    };
+                let description = if i + 1 < lines.len() {
+                    lines[i + 1].trim().to_string()
+                } else {
+                    String::new()
+                };
 
-                    packages.push(Package {
-                        name: name.to_string(),
-                        version: clean_version,
-                        description,
-                        repository: repository.to_string(),
-                        installed_version,
-                    });
+                packages.push(Package {
+                    name: name.to_string(),
+                    version: clean_version,
+                    description,
+                    repository: repository.to_string(),
+                    installed_version,
+                });
 
-                    i += 2;
-                    continue;
-                }
+                i += 2;
+                continue;
+            }
 
             i += 1;
         }
@@ -874,14 +879,15 @@ impl ParuBackend {
         let mut foreign_set = HashSet::new();
 
         if let Ok(output) = Command::new("pacman").env("LANG", "C").arg("-Qm").output()
-            && output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    if let Some(name) = line.split_whitespace().next() {
-                        foreign_set.insert(name.to_string());
-                    }
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some(name) = line.split_whitespace().next() {
+                    foreign_set.insert(name.to_string());
                 }
             }
+        }
 
         foreign_set
     }
@@ -900,33 +906,33 @@ impl ParuBackend {
         }
 
         if let Ok(output) = cmd.output()
-            && output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
 
-                let mut current_package = None;
-                let mut current_repo = None;
+            let mut current_package = None;
+            let mut current_repo = None;
 
-                for line in stdout.lines() {
-                    if line.starts_with("Name") {
-                        if let (Some(pkg), Some(repo)) =
-                            (current_package.take(), current_repo.take())
-                        {
-                            repo_map.insert(pkg, repo);
-                        }
+            for line in stdout.lines() {
+                if line.starts_with("Name") {
+                    if let (Some(pkg), Some(repo)) = (current_package.take(), current_repo.take()) {
+                        repo_map.insert(pkg, repo);
+                    }
 
-                        if let Some(name) = line.split(':').nth(1) {
-                            current_package = Some(name.trim().to_string());
-                        }
-                    } else if line.starts_with("Repository")
-                        && let Some(repo) = line.split(':').nth(1) {
-                            current_repo = Some(repo.trim().to_string());
-                        }
-                }
-
-                if let (Some(pkg), Some(repo)) = (current_package, current_repo) {
-                    repo_map.insert(pkg, repo);
+                    if let Some(name) = line.split(':').nth(1) {
+                        current_package = Some(name.trim().to_string());
+                    }
+                } else if line.starts_with("Repository")
+                    && let Some(repo) = line.split(':').nth(1)
+                {
+                    current_repo = Some(repo.trim().to_string());
                 }
             }
+
+            if let (Some(pkg), Some(repo)) = (current_package, current_repo) {
+                repo_map.insert(pkg, repo);
+            }
+        }
 
         repo_map
     }
@@ -943,16 +949,18 @@ impl ParuBackend {
                 let output = Command::new("pacman").arg("-Si").arg(package_name).output();
 
                 if let Ok(output) = output
-                    && output.status.success() {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        for line in stdout.lines() {
-                            if line.starts_with("Repository")
-                                && let Some(repo) = line.split(':').nth(1) {
-                                    repo_map.insert(package_name.clone(), repo.trim().to_string());
-                                    break;
-                                }
+                    && output.status.success()
+                {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        if line.starts_with("Repository")
+                            && let Some(repo) = line.split(':').nth(1)
+                        {
+                            repo_map.insert(package_name.clone(), repo.trim().to_string());
+                            break;
                         }
                     }
+                }
 
                 repo_map
                     .entry(package_name.clone())
