@@ -613,7 +613,7 @@ impl ParuBackend {
             .map_err(|e| format!("Failed to execute curl: {}", e))?;
 
         if !output.status.success() {
-            return Err(format!("Failed to fetch AUR comments page: HTTP error"));
+            return Err("Failed to fetch AUR comments page: HTTP error".to_string());
         }
 
         let html = String::from_utf8_lossy(&output.stdout);

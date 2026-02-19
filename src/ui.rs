@@ -1373,7 +1373,8 @@ impl ParuGui {
 
                     // Configure external button if AUR
                     if details.repository == "aur" {
-                        let aur_url = format!("https://aur.archlinux.org/packages/{}/", details.name);
+                        let aur_url =
+                            format!("https://aur.archlinux.org/packages/{}/", details.name);
                         external_btn.set_visible(true);
                         external_btn.connect_clicked(move |_| {
                             let _ = gio::AppInfo::launch_default_for_uri(
@@ -1558,11 +1559,14 @@ impl ParuGui {
                                     while let Some(child) = comments_list.first_child() {
                                         comments_list.remove(&child);
                                     }
-                                    let err = Label::new(Some(&format!("Failed to load comments: {}", e)));
+                                    let err = Label::new(Some(&format!(
+                                        "Failed to load comments: {}",
+                                        e
+                                    )));
                                     err.add_css_class("error");
                                     comments_list.append(&err);
                                 }
-                            }
+                            },
                         );
                     }
                 }
