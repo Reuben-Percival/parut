@@ -36,6 +36,8 @@ pub struct PackageDetails {
     pub install_reason: String,
     pub install_script: String,
     pub validated_by: String,
+    pub votes: String,
+    pub popularity: String,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +45,13 @@ pub struct NewsItem {
     pub title: String,
     pub link: String,
     pub published: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AurComment {
+    pub author: String,
+    pub date: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone)]
@@ -593,6 +602,102 @@ impl ParuBackend {
         Ok(items)
     }
 
+    pub fn fetch_aur_comments(package_name: &str) -> Result<Vec<AurComment>, String> {
+        log_debug(&format!("Fetching AUR comments for {}", package_name));
+        let url = format!("https://aur.archlinux.org/packages/{}/", package_name);
+
+        let output = Command::new("curl")
+            .arg("-fsSL")
+            .arg(&url)
+            .output()
+            .map_err(|e| format!("Failed to execute curl: {}", e))?;
+
+        if !output.status.success() {
+            return Err(format!("Failed to fetch AUR comments page: HTTP error"));
+        }
+
+        let html = String::from_utf8_lossy(&output.stdout);
+        let mut comments = Vec::new();
+
+        // Very basic HTML parsing for comments
+        // Each comment starts with <h4 class="comment-header"> or <div id="comment-..."
+        let parts: Vec<&str> = html.split("<h4 class=\"comment-header\">").collect();
+
+        for part in parts.into_iter().skip(1) {
+            // End of header
+            let Some(header_end) = part.find("</h4>") else {
+                continue;
+            };
+            let header = &part[..header_end];
+
+            // Extract author: <a href="/users/AUTHOR/">AUTHOR</a>
+            let author = if let Some(a_start) = header.find("/users/") {
+                let sub = &header[a_start + 7..];
+                if let Some(a_end) = sub.find('/') {
+                    sub[..a_end].to_string()
+                } else {
+                    "unknown".to_string()
+                }
+            } else {
+                "unknown".to_string()
+            };
+
+            // Extract date: title="Permalink to this comment">DATE</a>
+            let date = if let Some(d_start) = header.find("title=\"Permalink to this comment\">") {
+                let sub = &header[d_start + 34..];
+                if let Some(d_end) = sub.find("</a>") {
+                    sub[..d_end].to_string()
+                } else {
+                    "".to_string()
+                }
+            } else {
+                "".to_string()
+            };
+
+            // Extract content: <div class="article-content comment-content">...</div>
+            // Find content after header
+            let content_part = &part[header_end..];
+            let content = if let Some(c_start) =
+                content_part.find("<div class=\"article-content comment-content\">")
+            {
+                let sub = &content_part[c_start + 45..];
+                if let Some(c_end) = sub.find("</div>") {
+                    let raw_content = &sub[..c_end];
+                    // Clean up some basic HTML tags
+                    raw_content
+                        .replace("<p>", "")
+                        .replace("</p>", "\n")
+                        .replace("<br>", "\n")
+                        .replace("<code>", "`")
+                        .replace("</code>", "`")
+                        .replace("<pre>", "```\n")
+                        .replace("</pre>", "\n```")
+                        .trim()
+                        .to_string()
+                } else {
+                    "".to_string()
+                }
+            } else {
+                "".to_string()
+            };
+
+            if !author.is_empty() && !content.is_empty() {
+                comments.push(AurComment {
+                    author,
+                    date: Self::decode_html_entities(&date),
+                    content: Self::decode_html_entities(&content),
+                });
+            }
+        }
+
+        log_info(&format!(
+            "Fetched {} comments for {}",
+            comments.len(),
+            package_name
+        ));
+        Ok(comments)
+    }
+
     fn is_package_installed(name: &str) -> bool {
         Command::new("pacman")
             .arg("-Qi")
@@ -625,6 +730,8 @@ impl ParuBackend {
             install_reason: String::new(),
             install_script: String::new(),
             validated_by: String::new(),
+            votes: String::new(),
+            popularity: String::new(),
         };
 
         for line in output.lines() {
@@ -654,6 +761,8 @@ impl ParuBackend {
                     "Install Reason" => details.install_reason = value,
                     "Install Script" => details.install_script = value,
                     "Validated By" => details.validated_by = value,
+                    "Votes" => details.votes = value,
+                    "Popularity" => details.popularity = value,
                     _ => {}
                 }
             }

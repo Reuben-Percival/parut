@@ -1,5 +1,5 @@
 use crate::logger::{log_error, log_info};
-use crate::paru::{NewsItem, Package, ParuBackend};
+use crate::paru::{AurComment, NewsItem, Package, ParuBackend};
 use crate::task_queue::{TaskQueue, TaskStatus, TaskType, TaskWorker};
 use adw::prelude::*;
 use adw::{
@@ -1047,6 +1047,58 @@ impl ParuGui {
         }
     }
 
+    fn render_aur_comments(list_box: &Box, comments: &[AurComment]) {
+        while let Some(child) = list_box.first_child() {
+            list_box.remove(&child);
+        }
+
+        if comments.is_empty() {
+            let label = Label::new(Some("No comments found for this package."));
+            label.add_css_class("dim-label");
+            label.set_margin_top(12);
+            list_box.append(&label);
+            return;
+        }
+
+        for comment in comments {
+            let card = Box::new(Orientation::Vertical, 6);
+            card.add_css_class("card");
+            card.set_margin_bottom(12);
+            card.set_margin_top(4);
+            card.set_margin_start(4);
+            card.set_margin_end(4);
+
+            let header = Box::new(Orientation::Horizontal, 8);
+            header.set_margin_start(12);
+            header.set_margin_end(12);
+            header.set_margin_top(12);
+
+            let author = Label::new(Some(&comment.author));
+            author.add_css_class("heading");
+            author.set_halign(gtk4::Align::Start);
+            author.set_hexpand(true);
+            header.append(&author);
+
+            let date = Label::new(Some(&comment.date));
+            date.add_css_class("caption");
+            date.add_css_class("dim-label");
+            header.append(&date);
+            card.append(&header);
+
+            let content = Label::new(Some(&comment.content));
+            content.set_wrap(true);
+            content.set_xalign(0.0);
+            content.set_margin_start(12);
+            content.set_margin_end(12);
+            content.set_margin_bottom(12);
+            content.set_margin_top(4);
+            content.set_selectable(true);
+            card.append(&content);
+
+            list_box.append(&card);
+        }
+    }
+
     fn refresh_arch_news(news_list: &BoxRc, news_status: &LabelRc) {
         if !crate::settings::get().show_arch_news {
             while let Some(child) = news_list.borrow().first_child() {
@@ -1257,6 +1309,13 @@ impl ParuGui {
 
         let header_bar = HeaderBar::new();
         header_bar.set_show_end_title_buttons(true);
+
+        // External link button (will be configured after loading details)
+        let external_btn = Button::from_icon_name("external-link-symbolic");
+        external_btn.set_tooltip_text(Some("Open AUR page in browser"));
+        external_btn.set_visible(false);
+        header_bar.pack_start(&external_btn);
+
         vbox.append(&header_bar);
 
         let scrolled = ScrolledWindow::new();
@@ -1312,9 +1371,23 @@ impl ParuGui {
                 Ok(details) => {
                     loading_label_clone.set_text(&details.version);
 
+                    // Configure external button if AUR
+                    if details.repository == "aur" {
+                        let aur_url = format!("https://aur.archlinux.org/packages/{}/", details.name);
+                        external_btn.set_visible(true);
+                        external_btn.connect_clicked(move |_| {
+                            let _ = gio::AppInfo::launch_default_for_uri(
+                                &aur_url,
+                                None::<&gio::AppLaunchContext>,
+                            );
+                        });
+                    }
+
                     let fields = [
                         ("Description", &details.description),
                         ("Repository", &details.repository),
+                        ("Votes", &details.votes),
+                        ("Popularity", &details.popularity),
                         ("URL", &details.url),
                         ("Licenses", &details.licenses),
                         ("Groups", &details.groups),
@@ -1453,6 +1526,44 @@ impl ParuGui {
                         val.set_max_width_chars(60);
                         val.set_halign(gtk4::Align::Start);
                         grid.attach(&val, 0, row, 2, 1);
+                    }
+
+                    // AUR Comments section
+                    if details.repository == "aur" {
+                        content_box.append(&Separator::new(Orientation::Horizontal));
+
+                        let comments_header = Box::new(Orientation::Horizontal, 8);
+                        let comments_icon = Image::from_icon_name("chat-bubbles-symbolic");
+                        comments_header.append(&comments_icon);
+
+                        let comments_title = Label::new(Some("AUR Comments"));
+                        comments_title.add_css_class("heading");
+                        comments_header.append(&comments_title);
+                        content_box.append(&comments_header);
+
+                        let comments_list = Box::new(Orientation::Vertical, 0);
+                        let loading_comments = Label::new(Some("Fetching comments..."));
+                        loading_comments.add_css_class("dim-label");
+                        comments_list.append(&loading_comments);
+                        content_box.append(&comments_list);
+
+                        let pkg_name = details.name.clone();
+                        Self::run_blocking(
+                            move || ParuBackend::fetch_aur_comments(&pkg_name),
+                            move |res| match res {
+                                Ok(comments) => {
+                                    Self::render_aur_comments(&comments_list, &comments);
+                                }
+                                Err(e) => {
+                                    while let Some(child) = comments_list.first_child() {
+                                        comments_list.remove(&child);
+                                    }
+                                    let err = Label::new(Some(&format!("Failed to load comments: {}", e)));
+                                    err.add_css_class("error");
+                                    comments_list.append(&err);
+                                }
+                            }
+                        );
                     }
                 }
                 Err(e) => {
