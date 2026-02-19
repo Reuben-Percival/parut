@@ -2,6 +2,7 @@ use adw::prelude::*;
 use adw::{Application, ApplicationWindow, StyleManager};
 use gtk4::{CssProvider, gdk, glib};
 
+mod data_store;
 mod logger;
 mod paru;
 mod settings;
@@ -21,6 +22,7 @@ fn main() -> glib::ExitCode {
 
     // Initialize settings
     settings::init();
+    data_store::init();
 
     let app = Application::builder().application_id(APP_ID).build();
 

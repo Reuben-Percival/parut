@@ -1,9 +1,10 @@
 use crate::logger::{log_debug, log_error, log_info, log_warning};
 use crate::settings;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {
     pub name: String,
     pub version: String,
@@ -17,6 +18,7 @@ pub struct PackageDetails {
     pub name: String,
     pub version: String,
     pub description: String,
+    pub repository: String,
     pub url: String,
     pub licenses: String,
     pub groups: String,
@@ -41,6 +43,13 @@ pub struct NewsItem {
     pub title: String,
     pub link: String,
     pub published: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CleanupEstimate {
+    pub pacman_cache_bytes: u64,
+    pub paru_clone_bytes: u64,
+    pub orphan_count: usize,
 }
 
 pub struct ParuBackend;
@@ -304,12 +313,20 @@ impl ParuBackend {
         Ok(pkgbuild)
     }
 
-    pub fn install_package<F>(name: &str, output_callback: F) -> Result<(), String>
+    pub fn install_package<F>(
+        name: &str,
+        output_callback: F,
+        cancel_requested: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), String>
     where
         F: Fn(String) + Send + Sync + 'static,
     {
         log_info(&format!("Starting installation of package: {}", name));
-        let result = Self::run_paru_in_terminal(&["-S", "--noconfirm", name], output_callback);
+        let result = Self::run_paru_in_terminal(
+            &["-S", "--noconfirm", name],
+            output_callback,
+            cancel_requested,
+        );
 
         match &result {
             Ok(_) => log_info(&format!("Successfully installed package: {}", name)),
@@ -323,13 +340,21 @@ impl ParuBackend {
         result
     }
 
-    pub fn remove_package<F>(name: &str, output_callback: F) -> Result<(), String>
+    pub fn remove_package<F>(
+        name: &str,
+        output_callback: F,
+        cancel_requested: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), String>
     where
         F: Fn(String) + Send + Sync + 'static,
     {
         log_info(&format!("Starting removal of package: {}", name));
 
-        let result = Self::run_paru_in_terminal(&["-Rns", "--noconfirm", name], output_callback);
+        let result = Self::run_paru_in_terminal(
+            &["-Rns", "--noconfirm", name],
+            output_callback,
+            cancel_requested,
+        );
 
         match &result {
             Ok(_) => log_info(&format!("Successfully removed package: {}", name)),
@@ -343,13 +368,36 @@ impl ParuBackend {
         result
     }
 
-    pub fn update_system<F>(output_callback: F) -> Result<(), String>
+    pub fn update_system<F>(
+        output_callback: F,
+        cancel_requested: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), String>
     where
         F: Fn(String) + Send + Sync + 'static,
     {
         log_info("Starting system update");
+        let settings = settings::get();
+        let mut args = vec!["-Syu", "--noconfirm"];
+        match settings.default_update_scope.as_str() {
+            "repo-only" => args.push("--repo"),
+            "aur-only" => args.push("--aur"),
+            _ => {}
+        }
 
-        let result = Self::run_paru_in_terminal(&["-Syu", "--noconfirm"], output_callback);
+        let ignored: Vec<String> = settings
+            .ignored_updates
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut owned_args: Vec<String> = args.into_iter().map(ToString::to_string).collect();
+        if !ignored.is_empty() {
+            owned_args.push("--ignore".to_string());
+            owned_args.push(ignored.join(","));
+        }
+        let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+
+        let result = Self::run_paru_in_terminal(&arg_refs, output_callback, cancel_requested);
 
         match &result {
             Ok(_) => log_info("System update completed successfully"),
@@ -359,14 +407,42 @@ impl ParuBackend {
         result
     }
 
-    pub fn clean_cache<F>(output_callback: F) -> Result<(), String>
+    pub fn update_package<F>(
+        name: &str,
+        output_callback: F,
+        cancel_requested: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), String>
+    where
+        F: Fn(String) + Send + Sync + 'static,
+    {
+        log_info(&format!("Starting update of package: {}", name));
+
+        let result = Self::run_paru_in_terminal(
+            &["-S", "--noconfirm", name],
+            output_callback,
+            cancel_requested,
+        );
+
+        match &result {
+            Ok(_) => log_info(&format!("Successfully updated package: {}", name)),
+            Err(e) => log_error(&format!("Package update failed for {}: {}", name, e)),
+        }
+
+        result
+    }
+
+    pub fn clean_cache<F>(
+        output_callback: F,
+        cancel_requested: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), String>
     where
         F: Fn(String) + Send + Sync + 'static,
     {
         log_info("Starting cache cleanup");
 
         // -Sc removes uninstalled packages from cache
-        let result = Self::run_paru_in_terminal(&["-Sc", "--noconfirm"], output_callback);
+        let result =
+            Self::run_paru_in_terminal(&["-Sc", "--noconfirm"], output_callback, cancel_requested);
 
         match &result {
             Ok(_) => log_info("Cache cleanup completed successfully"),
@@ -376,14 +452,48 @@ impl ParuBackend {
         result
     }
 
-    pub fn remove_orphans<F>(output_callback: F) -> Result<(), String>
+    pub fn estimate_cleanup() -> CleanupEstimate {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let paru_clone = if home.is_empty() {
+            0
+        } else {
+            Self::dir_size_bytes(&format!("{}/.cache/paru/clone", home))
+        };
+        let pacman_cache = Self::dir_size_bytes("/var/cache/pacman/pkg");
+
+        let orphan_count = Command::new("pacman")
+            .arg("-Qtdq")
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    Some(s.lines().count())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        CleanupEstimate {
+            pacman_cache_bytes: pacman_cache,
+            paru_clone_bytes: paru_clone,
+            orphan_count,
+        }
+    }
+
+    pub fn remove_orphans<F>(
+        output_callback: F,
+        cancel_requested: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), String>
     where
         F: Fn(String) + Send + Sync + 'static,
     {
         log_info("Starting orphan removal");
 
         // -c removes orphans (recursive)
-        let result = Self::run_paru_in_terminal(&["-c", "--noconfirm"], output_callback);
+        let result =
+            Self::run_paru_in_terminal(&["-c", "--noconfirm"], output_callback, cancel_requested);
 
         match &result {
             Ok(_) => log_info("Orphan removal completed successfully"),
@@ -476,6 +586,7 @@ impl ParuBackend {
             name: name.to_string(),
             version: String::new(),
             description: String::new(),
+            repository: String::new(),
             url: String::new(),
             licenses: String::new(),
             groups: String::new(),
@@ -504,6 +615,7 @@ impl ParuBackend {
                     "Name" => details.name = value,
                     "Version" => details.version = value,
                     "Description" => details.description = value,
+                    "Repository" => details.repository = value,
                     "URL" => details.url = value,
                     "Licenses" => details.licenses = value,
                     "Groups" => details.groups = value,
@@ -547,7 +659,11 @@ impl ParuBackend {
             .replace("&#39;", "'")
     }
 
-    fn run_paru_in_terminal<F>(args: &[&str], output_callback: F) -> Result<(), String>
+    fn run_paru_in_terminal<F>(
+        args: &[&str],
+        output_callback: F,
+        cancel_requested: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), String>
     where
         F: Fn(String) + Send + Sync + 'static,
     {
@@ -591,15 +707,29 @@ impl ParuBackend {
             match cmd.spawn() {
                 Ok(mut child) => {
                     output_callback("Terminal opened - waiting for completion...".to_string());
-                    let status = child
-                        .wait()
-                        .map_err(|e| format!("Failed to wait for terminal: {}", e))?;
+                    loop {
+                        if cancel_requested() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            output_callback("Task canceled by user.".to_string());
+                            return Err("Task canceled by user".to_string());
+                        }
 
-                    if status.success() {
-                        return Ok(());
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                if status.success() {
+                                    return Ok(());
+                                }
+                                return Err("Operation failed - check terminal output".to_string());
+                            }
+                            Ok(None) => {
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                            }
+                            Err(e) => {
+                                return Err(format!("Failed to wait for terminal: {}", e));
+                            }
+                        }
                     }
-
-                    return Err("Operation failed - check terminal output".to_string());
                 }
                 Err(e) => {
                     last_error = format!("Failed to spawn {}: {}", terminal, e);
@@ -625,6 +755,24 @@ impl ParuBackend {
                     .any(|full| full.is_file())
             })
             .unwrap_or(false)
+    }
+
+    fn dir_size_bytes(path: &str) -> u64 {
+        Command::new("du")
+            .arg("-sb")
+            .arg(path)
+            .output()
+            .ok()
+            .and_then(|o| {
+                if !o.status.success() {
+                    return None;
+                }
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
     }
 
     fn parse_search_output(output: &str) -> Vec<Package> {

@@ -7,10 +7,12 @@ use adw::{
     ViewStack, ViewSwitcher,
 };
 use gtk4::{
-    Box, Button, DropDown, Image, Label, ListBox, Orientation, ProgressBar, ScrolledWindow,
-    SearchEntry, Separator, Spinner, StringList, TextView, Window, glib,
+    Box, Button, CheckButton, DropDown, Entry, Image, Label, ListBox, Orientation, ProgressBar,
+    ScrolledWindow, SearchEntry, Separator, Spinner, StringList, TextView, Window, gio, glib,
 };
 use std::cell::RefCell;
+use std::collections::HashSet;
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -187,6 +189,17 @@ impl ParuGui {
         let updates_page = view_stack.add_titled(&updates_view.0, Some("updates"), "Updates");
         updates_page.set_icon_name(Some("software-update-available-symbolic"));
 
+        // Watchlist view
+        let watchlist_view = Self::create_watchlist_view(
+            task_queue.clone(),
+            installed_view.1.clone(),
+            updates_view.1.clone(),
+        );
+        let watchlist_page =
+            view_stack.add_titled(&watchlist_view.0, Some("watchlist"), "Watchlist");
+        watchlist_page.set_icon_name(Some("starred-symbolic"));
+        view_stack.set_visible_child_name(&crate::settings::get().startup_tab);
+
         content_box.append(&view_stack);
         main_box.append(&content_box);
 
@@ -204,6 +217,9 @@ impl ParuGui {
         // Connect refresh button
         let installed_list = installed_view.2.clone();
         let updates_list = updates_view.2.clone();
+        let updates_renderer = updates_view.3.clone();
+        let installed_renderer = installed_view.4.clone();
+        let installed_renderer_for_refresh = installed_renderer.clone();
         let installed_packages_clone = gui.installed_packages.clone();
         let updates_clone = gui.updates.clone();
         let task_queue_for_refresh = gui.task_queue.clone();
@@ -234,13 +250,21 @@ impl ParuGui {
                 &installed_list,
                 &installed_packages_clone,
                 task_queue_for_refresh.clone(),
+                Some(installed_renderer_for_refresh.clone()),
+                Some(refresh_label_clone.clone()),
+                Some(refresh_timer_clone.clone()),
             );
             Self::refresh_updates(
                 &updates_list,
                 &updates_clone,
                 task_queue_for_refresh.clone(),
+                Some(updates_renderer.clone()),
+                Some(refresh_label_clone.clone()),
+                Some(refresh_timer_clone.clone()),
             );
-            Self::update_refresh_time(&refresh_label_clone, &refresh_timer_clone);
+            refresh_label_clone
+                .borrow()
+                .set_text("Refreshing package data...");
 
             // Update dashboard stats
             Self::refresh_dashboard_stats(&dash_label_0, &dash_label_1, &dash_label_2);
@@ -256,25 +280,53 @@ impl ParuGui {
         });
 
         // Initial load
+        let cached_installed = crate::data_store::cached_installed();
+        let installed_cache_fresh =
+            crate::data_store::cached_installed_at().is_some_and(Self::is_cache_within_ttl);
+        if !cached_installed.is_empty() && installed_cache_fresh {
+            *gui.installed_packages.borrow_mut() = cached_installed.clone();
+            (installed_view.4)();
+        }
+
+        let cached_updates = crate::data_store::cached_updates();
+        let updates_cache_fresh =
+            crate::data_store::cached_updates_at().is_some_and(Self::is_cache_within_ttl);
+        if !cached_updates.is_empty() && updates_cache_fresh {
+            *gui.updates.borrow_mut() = cached_updates;
+            (updates_view.3)();
+        }
+
         Self::refresh_installed(
             &installed_view.2,
             &gui.installed_packages,
             gui.task_queue.clone(),
+            Some(installed_renderer.clone()),
+            Some(gui.last_refresh_label.clone()),
+            Some(gui.refresh_timer_id.clone()),
         );
 
         if crate::settings::get().check_updates_on_startup {
-            Self::refresh_updates(&updates_view.2, &gui.updates, gui.task_queue.clone());
+            Self::refresh_updates(
+                &updates_view.2,
+                &gui.updates,
+                gui.task_queue.clone(),
+                Some(updates_view.3.clone()),
+                Some(gui.last_refresh_label.clone()),
+                Some(gui.refresh_timer_id.clone()),
+            );
         }
 
         Self::refresh_dashboard_stats(&dash_label_0_init, &dash_label_1_init, &dash_label_2_init);
         Self::refresh_arch_news(&dash_news_list_init, &dash_news_status_init);
-        Self::update_refresh_time(&gui.last_refresh_label, &gui.refresh_timer_id);
+        Self::update_refresh_time_from_cache(&gui.last_refresh_label, &gui.refresh_timer_id);
         Self::setup_auto_refresh(
             &installed_view.2,
             &updates_view.2,
             &gui.installed_packages,
             &gui.updates,
             gui.task_queue.clone(),
+            Some(installed_renderer.clone()),
+            Some(updates_view.3.clone()),
             &dash_label_0_init,
             &dash_label_1_init,
             &dash_label_2_init,
@@ -283,6 +335,22 @@ impl ParuGui {
             &gui.last_refresh_label,
             &gui.refresh_timer_id,
             &gui.auto_refresh_timer_id,
+        );
+        Self::setup_network_reconnect_refresh(
+            &installed_view.2,
+            &updates_view.2,
+            &gui.installed_packages,
+            &gui.updates,
+            gui.task_queue.clone(),
+            Some(installed_renderer.clone()),
+            Some(updates_view.3.clone()),
+            &dash_label_0_init,
+            &dash_label_1_init,
+            &dash_label_2_init,
+            &dash_news_list_init,
+            &dash_news_status_init,
+            &gui.last_refresh_label,
+            &gui.refresh_timer_id,
         );
 
         gui
@@ -327,14 +395,28 @@ impl ParuGui {
     }
 
     fn filter_updates_by_source(packages: Vec<Package>) -> Vec<Package> {
-        match crate::settings::get().show_only_updates_from.as_str() {
+        let settings = crate::settings::get();
+        let ignored: std::collections::HashSet<String> = settings
+            .ignored_updates
+            .into_iter()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let scoped: Vec<Package> = match settings.show_only_updates_from.as_str() {
             "repo-only" => packages
                 .into_iter()
                 .filter(|p| p.repository != "aur")
                 .collect(),
-            "aur-only" => packages.into_iter().filter(|p| p.repository == "aur").collect(),
+            "aur-only" => packages
+                .into_iter()
+                .filter(|p| p.repository == "aur")
+                .collect(),
             _ => packages,
-        }
+        };
+        scoped
+            .into_iter()
+            .filter(|p| !ignored.contains(&p.name.to_lowercase()))
+            .collect()
     }
 
     fn setup_auto_refresh(
@@ -343,6 +425,8 @@ impl ParuGui {
         installed_packages: &Rc<RefCell<Vec<Package>>>,
         updates: &Rc<RefCell<Vec<Package>>>,
         task_queue: Arc<TaskQueue>,
+        installed_renderer: Option<Rc<dyn Fn()>>,
+        updates_renderer: Option<Rc<dyn Fn()>>,
         dash_installed: &Rc<RefCell<Label>>,
         dash_updates: &Rc<RefCell<Label>>,
         dash_aur: &Rc<RefCell<Label>>,
@@ -365,6 +449,8 @@ impl ParuGui {
         let installed_packages = installed_packages.clone();
         let updates = updates.clone();
         let task_queue_cloned = task_queue.clone();
+        let installed_renderer_cloned = installed_renderer.clone();
+        let updates_renderer_cloned = updates_renderer.clone();
         let dash_installed = dash_installed.clone();
         let dash_updates = dash_updates.clone();
         let dash_aur = dash_aur.clone();
@@ -374,14 +460,94 @@ impl ParuGui {
         let refresh_timer = refresh_timer.clone();
 
         let id = glib::timeout_add_seconds_local(interval_secs, move || {
-            Self::refresh_installed(&installed_list, &installed_packages, task_queue_cloned.clone());
-            Self::refresh_updates(&updates_list, &updates, task_queue_cloned.clone());
+            Self::refresh_installed(
+                &installed_list,
+                &installed_packages,
+                task_queue_cloned.clone(),
+                installed_renderer_cloned.clone(),
+                Some(refresh_label.clone()),
+                Some(refresh_timer.clone()),
+            );
+            Self::refresh_updates(
+                &updates_list,
+                &updates,
+                task_queue_cloned.clone(),
+                updates_renderer_cloned.clone(),
+                Some(refresh_label.clone()),
+                Some(refresh_timer.clone()),
+            );
             Self::refresh_dashboard_stats(&dash_installed, &dash_updates, &dash_aur);
             Self::refresh_arch_news(&dash_news_list, &dash_news_status);
-            Self::update_refresh_time(&refresh_label, &refresh_timer);
+            refresh_label
+                .borrow()
+                .set_text("Refreshing package data...");
             glib::ControlFlow::Continue
         });
         *auto_refresh_timer.borrow_mut() = Some(id);
+    }
+
+    fn setup_network_reconnect_refresh(
+        installed_list: &Rc<RefCell<ListBox>>,
+        updates_list: &Rc<RefCell<ListBox>>,
+        installed_packages: &Rc<RefCell<Vec<Package>>>,
+        updates: &Rc<RefCell<Vec<Package>>>,
+        task_queue: Arc<TaskQueue>,
+        installed_renderer: Option<Rc<dyn Fn()>>,
+        updates_renderer: Option<Rc<dyn Fn()>>,
+        dash_installed: &Rc<RefCell<Label>>,
+        dash_updates: &Rc<RefCell<Label>>,
+        dash_aur: &Rc<RefCell<Label>>,
+        dash_news_list: &Rc<RefCell<Box>>,
+        dash_news_status: &Rc<RefCell<Label>>,
+        refresh_label: &Rc<RefCell<Label>>,
+        refresh_timer: &Rc<RefCell<Option<glib::SourceId>>>,
+    ) {
+        if !crate::settings::get().refresh_on_network_reconnect {
+            return;
+        }
+
+        let monitor = gio::NetworkMonitor::default();
+        let installed_list = installed_list.clone();
+        let updates_list = updates_list.clone();
+        let installed_packages = installed_packages.clone();
+        let updates = updates.clone();
+        let task_queue = task_queue.clone();
+        let installed_renderer = installed_renderer.clone();
+        let updates_renderer = updates_renderer.clone();
+        let dash_installed = dash_installed.clone();
+        let dash_updates = dash_updates.clone();
+        let dash_aur = dash_aur.clone();
+        let dash_news_list = dash_news_list.clone();
+        let dash_news_status = dash_news_status.clone();
+        let refresh_label = refresh_label.clone();
+        let refresh_timer = refresh_timer.clone();
+
+        monitor.connect_network_changed(move |_, available| {
+            if !available {
+                return;
+            }
+            Self::refresh_installed(
+                &installed_list,
+                &installed_packages,
+                task_queue.clone(),
+                installed_renderer.clone(),
+                Some(refresh_label.clone()),
+                Some(refresh_timer.clone()),
+            );
+            Self::refresh_updates(
+                &updates_list,
+                &updates,
+                task_queue.clone(),
+                updates_renderer.clone(),
+                Some(refresh_label.clone()),
+                Some(refresh_timer.clone()),
+            );
+            Self::refresh_dashboard_stats(&dash_installed, &dash_updates, &dash_aur);
+            Self::refresh_arch_news(&dash_news_list, &dash_news_status);
+            refresh_label
+                .borrow()
+                .set_text("Network reconnected, refreshing...");
+        });
     }
 
     fn show_confirmation_dialog<F>(parent: &gtk4::Window, title: &str, body: &str, on_confirm: F)
@@ -427,6 +593,101 @@ impl ParuGui {
         let dialog_weak2 = dialog.downgrade();
         confirm.connect_clicked(move |_| {
             on_confirm();
+            if let Some(d) = dialog_weak2.upgrade() {
+                d.close();
+            }
+        });
+
+        dialog.present();
+    }
+
+    fn format_bytes(bytes: u64) -> String {
+        const KB: f64 = 1024.0;
+        const MB: f64 = KB * 1024.0;
+        const GB: f64 = MB * 1024.0;
+        let b = bytes as f64;
+        if b >= GB {
+            format!("{:.1} GB", b / GB)
+        } else if b >= MB {
+            format!("{:.1} MB", b / MB)
+        } else if b >= KB {
+            format!("{:.1} KB", b / KB)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+
+    fn show_cleanup_wizard(parent: &gtk4::Window, task_queue: Arc<TaskQueue>) {
+        let dialog = Window::builder()
+            .title("Cleanup Wizard")
+            .default_width(520)
+            .default_height(320)
+            .modal(true)
+            .transient_for(parent)
+            .build();
+
+        let root = Box::new(Orientation::Vertical, 12);
+        root.set_margin_start(16);
+        root.set_margin_end(16);
+        root.set_margin_top(16);
+        root.set_margin_bottom(16);
+
+        let description = Label::new(Some(
+            "Choose cleanup actions. Estimated reclaim is shown below.",
+        ));
+        description.set_halign(gtk4::Align::Start);
+        description.add_css_class("dim-label");
+        root.append(&description);
+
+        let check_cache = CheckButton::with_label("Clean package cache");
+        check_cache.set_active(true);
+        root.append(&check_cache);
+
+        let check_orphans = CheckButton::with_label("Remove orphaned dependencies");
+        check_orphans.set_active(true);
+        root.append(&check_orphans);
+
+        let estimate_label = Label::new(Some("Calculating estimates..."));
+        estimate_label.set_halign(gtk4::Align::Start);
+        estimate_label.set_wrap(true);
+        root.append(&estimate_label);
+
+        let buttons = Box::new(Orientation::Horizontal, 8);
+        buttons.set_halign(gtk4::Align::End);
+        let cancel_btn = Button::with_label("Cancel");
+        let run_btn = Button::with_label("Run Cleanup");
+        run_btn.add_css_class("suggested-action");
+        buttons.append(&cancel_btn);
+        buttons.append(&run_btn);
+        root.append(&buttons);
+
+        dialog.set_child(Some(&root));
+
+        let estimate_label_clone = estimate_label.clone();
+        Self::run_blocking(ParuBackend::estimate_cleanup, move |estimate| {
+            let cache = Self::format_bytes(estimate.pacman_cache_bytes);
+            let paru = Self::format_bytes(estimate.paru_clone_bytes);
+            estimate_label_clone.set_text(&format!(
+                "Estimated reclaim:\n • Pacman cache: {}\n • Paru build cache: {}\n • Orphans: {} package(s)",
+                cache, paru, estimate.orphan_count
+            ));
+        });
+
+        let dialog_weak = dialog.downgrade();
+        cancel_btn.connect_clicked(move |_| {
+            if let Some(d) = dialog_weak.upgrade() {
+                d.close();
+            }
+        });
+
+        let dialog_weak2 = dialog.downgrade();
+        run_btn.connect_clicked(move |_| {
+            if check_cache.is_active() {
+                task_queue.add_task(TaskType::CleanCache, "system".to_string());
+            }
+            if check_orphans.is_active() {
+                task_queue.add_task(TaskType::RemoveOrphans, "system".to_string());
+            }
             if let Some(d) = dialog_weak2.upgrade() {
                 d.close();
             }
@@ -540,30 +801,14 @@ impl ParuGui {
 
         // Orphans cleanup button
         let clean_btn = Self::create_action_button(
-            "Clean Cache",
+            "Cleanup Wizard",
             "user-trash-symbolic",
-            "Clean package cache to free disk space",
+            "Estimate reclaimable space and clean cache/orphans",
         );
         let tq_clean = task_queue.clone();
         clean_btn.connect_clicked(move |btn| {
-            let needs_confirm =
-                crate::settings::get().confirm_clean_cache || crate::settings::get().confirm_actions;
-            if needs_confirm {
-                if let Some(window) = btn.root().and_then(|w| w.downcast::<gtk4::Window>().ok()) {
-                    let tq_confirm = tq_clean.clone();
-                    Self::show_confirmation_dialog(
-                        &window,
-                        "Confirm Cache Cleanup",
-                        "Clean package cache now?",
-                        move || {
-                            log_info("Starting cache cleanup from dashboard");
-                            tq_confirm.add_task(TaskType::CleanCache, "system".to_string());
-                        },
-                    );
-                }
-            } else {
-                log_info("Starting cache cleanup from dashboard");
-                tq_clean.add_task(TaskType::CleanCache, "system".to_string());
+            if let Some(window) = btn.root().and_then(|w| w.downcast::<gtk4::Window>().ok()) {
+                Self::show_cleanup_wizard(&window, tq_clean.clone());
             }
         });
         actions_box.append(&clean_btn);
@@ -747,7 +992,9 @@ impl ParuGui {
         Self::run_blocking(
             move || {
                 let installed = ParuBackend::list_installed().ok();
-                let updates = ParuBackend::list_updates().ok().map(Self::filter_updates_by_source);
+                let updates = ParuBackend::list_updates()
+                    .ok()
+                    .map(Self::filter_updates_by_source);
                 (installed, updates)
             },
             move |(installed, updates)| {
@@ -776,12 +1023,19 @@ impl ParuGui {
             let row = Box::new(Orientation::Vertical, 2);
             row.set_margin_bottom(8);
 
-            let link_btn = gtk4::LinkButton::builder()
-                .uri(&item.link)
-                .label(&item.title)
-                .build();
+            let link_btn = Button::with_label(&item.title);
             link_btn.set_halign(gtk4::Align::Start);
             link_btn.add_css_class("flat");
+            let uri = item.link.clone();
+            link_btn.connect_clicked(move |_| {
+                if crate::settings::get().open_links_in_external_browser {
+                    let _ =
+                        gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+                } else if let Some(display) = gtk4::gdk::Display::default() {
+                    display.clipboard().set_text(&uri);
+                    crate::utils::send_notification("Parut", "Link copied to clipboard");
+                }
+            });
             row.append(&link_btn);
 
             if crate::settings::get().show_arch_news_dates && !item.published.is_empty() {
@@ -801,7 +1055,9 @@ impl ParuGui {
             while let Some(child) = news_list.borrow().first_child() {
                 news_list.borrow().remove(&child);
             }
-            news_status.borrow().set_text("Arch News is disabled in settings.");
+            news_status
+                .borrow()
+                .set_text("Arch News is disabled in settings.");
             return;
         }
 
@@ -1061,13 +1317,17 @@ impl ParuGui {
 
                     let fields = [
                         ("Description", &details.description),
+                        ("Repository", &details.repository),
                         ("URL", &details.url),
                         ("Licenses", &details.licenses),
-                        ("Repository", &details.groups), // Just re-using groups/repo if available, logic might need tuning
+                        ("Groups", &details.groups),
+                        ("Provides", &details.provides),
                         ("Size", &details.installed_size),
                         ("Packager", &details.packager),
                         ("Build Date", &details.build_date),
                         ("Install Date", &details.install_date),
+                        ("Install Reason", &details.install_reason),
+                        ("Install Script", &details.install_script),
                         ("Validated By", &details.validated_by),
                     ];
 
@@ -1091,8 +1351,14 @@ impl ParuGui {
                         }
                     }
 
-                    // Dependencies section
-                    if !details.depends_on.is_empty() || !details.required_by.is_empty() {
+                    // Relationship section
+                    if !details.depends_on.is_empty()
+                        || !details.optional_deps.is_empty()
+                        || !details.required_by.is_empty()
+                        || !details.optional_for.is_empty()
+                        || !details.conflicts_with.is_empty()
+                        || !details.replaces.is_empty()
+                    {
                         grid.attach(&Separator::new(Orientation::Horizontal), 0, row, 2, 1);
                         row += 1;
                     }
@@ -1113,6 +1379,22 @@ impl ParuGui {
                         row += 1;
                     }
 
+                    if !details.optional_deps.is_empty() {
+                        let label = Label::new(Some("Optional Deps"));
+                        label.add_css_class("heading");
+                        label.set_halign(gtk4::Align::Start);
+                        label.set_margin_top(12);
+                        grid.attach(&label, 0, row, 2, 1);
+                        row += 1;
+
+                        let val = Label::new(Some(&details.optional_deps));
+                        val.set_wrap(true);
+                        val.set_max_width_chars(60);
+                        val.set_halign(gtk4::Align::Start);
+                        grid.attach(&val, 0, row, 2, 1);
+                        row += 1;
+                    }
+
                     if !details.required_by.is_empty() {
                         let label = Label::new(Some("Required By"));
                         label.add_css_class("heading");
@@ -1122,6 +1404,54 @@ impl ParuGui {
                         row += 1;
 
                         let val = Label::new(Some(&details.required_by));
+                        val.set_wrap(true);
+                        val.set_max_width_chars(60);
+                        val.set_halign(gtk4::Align::Start);
+                        grid.attach(&val, 0, row, 2, 1);
+                        row += 1;
+                    }
+
+                    if !details.optional_for.is_empty() {
+                        let label = Label::new(Some("Optional For"));
+                        label.add_css_class("heading");
+                        label.set_halign(gtk4::Align::Start);
+                        label.set_margin_top(12);
+                        grid.attach(&label, 0, row, 2, 1);
+                        row += 1;
+
+                        let val = Label::new(Some(&details.optional_for));
+                        val.set_wrap(true);
+                        val.set_max_width_chars(60);
+                        val.set_halign(gtk4::Align::Start);
+                        grid.attach(&val, 0, row, 2, 1);
+                        row += 1;
+                    }
+
+                    if !details.conflicts_with.is_empty() {
+                        let label = Label::new(Some("Conflicts With"));
+                        label.add_css_class("heading");
+                        label.set_halign(gtk4::Align::Start);
+                        label.set_margin_top(12);
+                        grid.attach(&label, 0, row, 2, 1);
+                        row += 1;
+
+                        let val = Label::new(Some(&details.conflicts_with));
+                        val.set_wrap(true);
+                        val.set_max_width_chars(60);
+                        val.set_halign(gtk4::Align::Start);
+                        grid.attach(&val, 0, row, 2, 1);
+                        row += 1;
+                    }
+
+                    if !details.replaces.is_empty() {
+                        let label = Label::new(Some("Replaces"));
+                        label.add_css_class("heading");
+                        label.set_halign(gtk4::Align::Start);
+                        label.set_margin_top(12);
+                        grid.attach(&label, 0, row, 2, 1);
+                        row += 1;
+
+                        let val = Label::new(Some(&details.replaces));
                         val.set_wrap(true);
                         val.set_max_width_chars(60);
                         val.set_halign(gtk4::Align::Start);
@@ -1174,7 +1504,9 @@ impl ParuGui {
         let clear_btn = Button::new();
         clear_btn.set_child(Some(&clear_box));
         clear_btn.add_css_class("flat");
-        clear_btn.set_tooltip_text(Some("Remove completed and failed tasks from the queue"));
+        clear_btn.set_tooltip_text(Some(
+            "Remove completed, canceled, and failed tasks from the queue",
+        ));
 
         let task_queue_clone = task_queue.clone();
         clear_btn.connect_clicked(move |_| {
@@ -1226,7 +1558,7 @@ impl ParuGui {
                 list_box.append(&empty_box);
             } else {
                 for task in &tasks {
-                    let row = Self::create_task_row(task);
+                    let row = Self::create_task_row(task, task_queue.clone());
                     list_box.append(&row);
                 }
             }
@@ -1244,7 +1576,7 @@ impl ParuGui {
         window.present();
     }
 
-    fn create_task_row(task: &crate::task_queue::Task) -> Box {
+    fn create_task_row(task: &crate::task_queue::Task, task_queue: Arc<TaskQueue>) -> Box {
         let row_box = Box::new(Orientation::Vertical, 8);
         row_box.set_margin_start(16);
         row_box.set_margin_end(16);
@@ -1259,6 +1591,7 @@ impl ParuGui {
             TaskType::Install => "list-add-symbolic",
             TaskType::Remove => "list-remove-symbolic",
             TaskType::Update => "software-update-available-symbolic",
+            TaskType::UpdatePackage => "software-update-urgent-symbolic",
             TaskType::CleanCache => "user-trash-symbolic",
             TaskType::RemoveOrphans => "edit-clear-all-symbolic",
         };
@@ -1270,6 +1603,7 @@ impl ParuGui {
             TaskType::Install => "Install",
             TaskType::Remove => "Remove",
             TaskType::Update => "Update",
+            TaskType::UpdatePackage => "Update Package",
             TaskType::CleanCache => "Clean Cache",
             TaskType::RemoveOrphans => "Remove Orphans",
         };
@@ -1309,6 +1643,15 @@ impl ParuGui {
                 label.add_css_class("success");
                 status_box.append(&label);
             }
+            TaskStatus::Canceled => {
+                let icon = Image::from_icon_name("process-stop-symbolic");
+                icon.set_pixel_size(16);
+                icon.add_css_class("dim-label");
+                status_box.append(&icon);
+                let label = Label::new(Some("Canceled"));
+                label.add_css_class("dim-label");
+                status_box.append(&label);
+            }
             TaskStatus::Failed(_) => {
                 let icon = Image::from_icon_name("dialog-error-symbolic");
                 icon.set_pixel_size(16);
@@ -1331,10 +1674,47 @@ impl ParuGui {
                 progress_bar.set_show_text(true);
                 progress_bar.set_text(Some(&format!("{}%", (progress * 100.0) as i32)));
                 row_box.append(&progress_bar);
+
+                let phase_eta = Box::new(Orientation::Horizontal, 8);
+                phase_eta.set_halign(gtk4::Align::Start);
+
+                if let Some(phase) = &task.phase {
+                    let phase_label = Label::new(Some(&format!("Phase: {}", phase)));
+                    phase_label.add_css_class("caption");
+                    phase_label.add_css_class("dim-label");
+                    phase_eta.append(&phase_label);
+                }
+
+                if let Some(started_at) = task.started_at_unix {
+                    if progress > 0.01 {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_secs())
+                            .unwrap_or(started_at);
+                        let elapsed = now.saturating_sub(started_at) as f64;
+                        let eta_secs = ((elapsed / progress) * (1.0 - progress)).max(0.0) as u64;
+                        let eta_label =
+                            Label::new(Some(&format!("ETA: {}", Self::format_duration(eta_secs))));
+                        eta_label.add_css_class("caption");
+                        eta_label.add_css_class("dim-label");
+                        phase_eta.append(&eta_label);
+                    }
+                }
+
+                row_box.append(&phase_eta);
             } else {
                 let progress_bar = ProgressBar::new();
                 progress_bar.pulse();
                 row_box.append(&progress_bar);
+
+                if let Some(phase) = &task.phase {
+                    let phase_label = Label::new(Some(&format!("Phase: {}", phase)));
+                    phase_label.add_css_class("caption");
+                    phase_label.add_css_class("dim-label");
+                    phase_label.set_halign(gtk4::Align::Start);
+                    row_box.append(&phase_label);
+                }
             }
         }
 
@@ -1384,6 +1764,73 @@ impl ParuGui {
             row_box.append(&output_box);
         }
 
+        // Task controls
+        let controls = Box::new(Orientation::Horizontal, 8);
+        controls.set_halign(gtk4::Align::End);
+
+        match task.status {
+            TaskStatus::Queued => {
+                let cancel_btn = Button::with_label("Cancel");
+                cancel_btn.add_css_class("flat");
+                let task_id = task.id;
+                let tq = task_queue.clone();
+                cancel_btn.connect_clicked(move |_| {
+                    tq.cancel_queued_task(task_id);
+                });
+                controls.append(&cancel_btn);
+
+                let run_now_btn = Button::with_label("Run Now");
+                run_now_btn.add_css_class("flat");
+                let task_id_run = task.id;
+                let tq_run = task_queue.clone();
+                run_now_btn.connect_clicked(move |_| {
+                    tq_run.run_queued_task_now(task_id_run);
+                });
+                controls.append(&run_now_btn);
+
+                let up_btn = Button::with_label("Up");
+                up_btn.add_css_class("flat");
+                let task_id_up = task.id;
+                let tq_up = task_queue.clone();
+                up_btn.connect_clicked(move |_| {
+                    tq_up.move_queued_task_up(task_id_up);
+                });
+                controls.append(&up_btn);
+
+                let down_btn = Button::with_label("Down");
+                down_btn.add_css_class("flat");
+                let task_id_down = task.id;
+                let tq_down = task_queue.clone();
+                down_btn.connect_clicked(move |_| {
+                    tq_down.move_queued_task_down(task_id_down);
+                });
+                controls.append(&down_btn);
+            }
+            TaskStatus::Running => {
+                let cancel_btn = Button::with_label("Cancel");
+                cancel_btn.add_css_class("destructive-action");
+                let task_id = task.id;
+                let tq = task_queue.clone();
+                cancel_btn.connect_clicked(move |_| {
+                    tq.request_cancel(task_id);
+                });
+                controls.append(&cancel_btn);
+            }
+            TaskStatus::Failed(_) => {
+                let retry_btn = Button::with_label("Retry");
+                retry_btn.add_css_class("suggested-action");
+                let task_id = task.id;
+                let tq = task_queue.clone();
+                retry_btn.connect_clicked(move |_| {
+                    let _ = tq.retry_failed_task(task_id);
+                });
+                controls.append(&retry_btn);
+            }
+            TaskStatus::Completed | TaskStatus::Canceled => {}
+        }
+
+        row_box.append(&controls);
+
         row_box
     }
 
@@ -1424,13 +1871,22 @@ impl ParuGui {
         search_box.append(&controls_box);
 
         let search_limit = crate::settings::get().search_result_limit;
-        let hint_label = Label::new(Some(
-            &format!("Start typing to search. Results limited to {} packages.", search_limit),
-        ));
+        let hint_label = Label::new(Some(&format!(
+            "Start typing to search. Results limited to {} packages.",
+            search_limit
+        )));
         hint_label.add_css_class("caption");
         hint_label.add_css_class("dim-label");
         hint_label.set_halign(gtk4::Align::Start);
         search_box.append(&hint_label);
+
+        let recent_box = Box::new(Orientation::Horizontal, 6);
+        recent_box.set_halign(gtk4::Align::Start);
+        search_box.append(&recent_box);
+
+        let trending_box = Box::new(Orientation::Horizontal, 6);
+        trending_box.set_halign(gtk4::Align::Start);
+        search_box.append(&trending_box);
 
         vbox.append(&search_box);
 
@@ -1456,21 +1912,145 @@ impl ParuGui {
         scrolled.set_child(Some(&list_box));
         vbox.append(&scrolled);
 
-        let packages = Rc::new(RefCell::new(Vec::new()));
+        let packages = Rc::new(RefCell::new(Vec::<Package>::new()));
         let list_box_rc = Rc::new(RefCell::new(list_box));
+        let selected_search: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+
+        let selection_bar = Box::new(Orientation::Horizontal, 8);
+        let selected_label = Label::new(Some("0 selected"));
+        selected_label.add_css_class("caption");
+        selected_label.add_css_class("dim-label");
+        selection_bar.append(&selected_label);
+
+        let clear_selected_btn = Button::with_label("Clear Selection");
+        clear_selected_btn.add_css_class("flat");
+        selection_bar.append(&clear_selected_btn);
+
+        let install_selected_btn = Button::with_label("Install Selected");
+        install_selected_btn.add_css_class("suggested-action");
+        install_selected_btn.set_sensitive(false);
+        selection_bar.append(&install_selected_btn);
+        search_box.append(&selection_bar);
 
         // Debounced search handler
         let list_box_clone = list_box_rc.clone();
         let packages_clone = packages.clone();
-        let task_queue_clone = task_queue.clone();
         let loading_clone = loading_box_rc.clone();
         let hint_label_rc = Rc::new(RefCell::new(hint_label));
         let hint_clone = hint_label_rc.clone();
         let sort_dropdown_clone = sort_dropdown.clone();
+        let recent_box_clone = recent_box.clone();
+        let trending_box_clone = trending_box.clone();
+        let search_entry_for_suggestions = search_entry.clone();
+        let selected_search_clone = selected_search.clone();
 
         // Store the timeout ID
         let timeout_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
         let timeout_id_clone = timeout_id.clone();
+        let selected_label_rc = Rc::new(RefCell::new(selected_label));
+
+        let render_search_results: Rc<dyn Fn(&[Package])> = {
+            let list_box = list_box_rc.clone();
+            let task_queue = task_queue.clone();
+            let selected = selected_search.clone();
+            let selected_label = selected_label_rc.clone();
+            let install_btn = install_selected_btn.clone();
+            Rc::new(move |pkgs: &[Package]| {
+                while let Some(child) = list_box.borrow().first_child() {
+                    list_box.borrow().remove(&child);
+                }
+
+                for package in pkgs {
+                    let row = Self::create_search_row(
+                        package,
+                        task_queue.clone(),
+                        selected.clone(),
+                        selected_label.clone(),
+                        install_btn.clone(),
+                    );
+                    list_box.borrow().append(&row);
+                }
+
+                let selected_count = selected.borrow().len();
+                selected_label
+                    .borrow()
+                    .set_text(&format!("{} selected", selected_count));
+                install_btn.set_sensitive(selected_count > 0);
+            })
+        };
+        let render_search_results_clone = render_search_results.clone();
+
+        {
+            let selected = selected_search.clone();
+            let selected_label = selected_label_rc.clone();
+            let install_btn = install_selected_btn.clone();
+            let render = render_search_results.clone();
+            let packages_for_clear = packages.clone();
+            clear_selected_btn.connect_clicked(move |_| {
+                selected.borrow_mut().clear();
+                selected_label.borrow().set_text("0 selected");
+                install_btn.set_sensitive(false);
+                render(&packages_for_clear.borrow());
+            });
+        }
+
+        {
+            let selected = selected_search.clone();
+            let all_packages = packages.clone();
+            let tq = task_queue.clone();
+            let render = render_search_results.clone();
+            install_selected_btn.connect_clicked(move |btn| {
+                let chosen = selected.borrow().clone();
+                let selected_pkgs: Vec<Package> = all_packages
+                    .borrow()
+                    .iter()
+                    .filter(|p| chosen.contains(&p.name))
+                    .cloned()
+                    .collect();
+                if selected_pkgs.is_empty() {
+                    return;
+                }
+                let has_aur = selected_pkgs.iter().any(|p| p.repository == "aur");
+                let to_queue = selected_pkgs.clone();
+
+                let queue_install = {
+                    let tq = tq.clone();
+                    let selected = selected.clone();
+                    let render = render.clone();
+                    let all_packages = all_packages.clone();
+                    move || {
+                        for pkg in &to_queue {
+                            tq.add_task(TaskType::Install, pkg.name.clone());
+                        }
+                        selected.borrow_mut().clear();
+                        render(&all_packages.borrow());
+                    }
+                };
+
+                let force_confirm = crate::settings::get().confirm_batch_install;
+                let strict_aur = crate::settings::get().always_show_pkgbuild_for_aur;
+                let needs_confirm =
+                    force_confirm || strict_aur || (has_aur && crate::settings::get().aur_pkgbuild_required);
+                if needs_confirm {
+                    if let Some(window) = btn.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
+                    {
+                        let msg = if has_aur {
+                            "Some selected packages are from AUR. Batch install will skip PKGBUILD review dialogs. Continue?"
+                        } else {
+                            "Install all selected packages?"
+                        };
+                        Self::show_confirmation_dialog(
+                            &window,
+                            "Batch Install Confirmation",
+                            msg,
+                            queue_install,
+                        );
+                    }
+                } else {
+                    queue_install();
+                }
+            });
+        }
 
         search_entry.connect_search_changed(move |entry| {
             let query = entry.text().to_string();
@@ -1481,17 +2061,16 @@ impl ParuGui {
             }
 
             if query.is_empty() {
+                selected_search_clone.borrow_mut().clear();
                 let list_box = list_box_clone.borrow();
                 while let Some(child) = list_box.first_child() {
                     list_box.remove(&child);
                 }
                 hint_clone.borrow().set_visible(true);
-                hint_clone
-                    .borrow()
-                    .set_text(&format!(
-                        "Start typing to search. Results limited to {} packages.",
-                        crate::settings::get().search_result_limit
-                    ));
+                hint_clone.borrow().set_text(&format!(
+                    "Start typing to search. Results limited to {} packages.",
+                    crate::settings::get().search_result_limit
+                ));
                 loading_clone.borrow().set_visible(false);
                 return;
             }
@@ -1507,12 +2086,17 @@ impl ParuGui {
             loading_clone.borrow().set_visible(true);
             hint_clone.borrow().set_visible(false);
 
-            let list_box = list_box_clone.clone();
             let packages = packages_clone.clone();
-            let task_queue = task_queue_clone.clone();
             let loading = loading_clone.clone();
             let hint = hint_clone.clone();
             let sort_dropdown = sort_dropdown_clone.clone();
+            let recent_box_for_timeout = recent_box_clone.clone();
+            let trending_box_for_timeout = trending_box_clone.clone();
+            let search_entry_for_timeout = search_entry_for_suggestions.clone();
+            let query_for_search = query.clone();
+            let query_for_record = query.clone();
+            let selected_for_timeout = selected_search_clone.clone();
+            let render_for_timeout = render_search_results_clone.clone();
 
             let timeout_id_inner = timeout_id_clone.clone();
 
@@ -1524,10 +2108,16 @@ impl ParuGui {
                 Self::run_blocking(
                     move || {
                         let limit = crate::settings::get().search_result_limit;
-                        ParuBackend::search_packages(&query, Some(limit))
+                        Self::smart_search_packages(&query_for_search, limit)
                     },
                     move |result| match result {
                         Ok(results) => {
+                            crate::data_store::record_search(&query_for_record);
+                            Self::populate_search_suggestions(
+                                &recent_box_for_timeout,
+                                &trending_box_for_timeout,
+                                &search_entry_for_timeout,
+                            );
                             let sort_idx = sort_dropdown.selected();
                             let sorted = Self::filter_and_sort_packages(&results, "", sort_idx);
                             loading.borrow().set_visible(false);
@@ -1541,12 +2131,8 @@ impl ParuGui {
                                     .set_text(&format!("Found {} packages", sorted.len()));
                             }
                             *packages.borrow_mut() = sorted.clone();
-                            Self::update_package_list(
-                                &list_box.borrow(),
-                                &sorted,
-                                true,
-                                task_queue,
-                            );
+                            selected_for_timeout.borrow_mut().clear();
+                            render_for_timeout(&sorted);
                         }
                         Err(e) => {
                             loading.borrow().set_visible(false);
@@ -1561,13 +2147,21 @@ impl ParuGui {
             *timeout_id.borrow_mut() = Some(id);
         });
 
+        Self::populate_search_suggestions(&recent_box, &trending_box, &search_entry);
+
         let list_box_clone2 = list_box_rc.clone();
         let packages_clone2 = packages.clone();
-        let task_queue_clone2 = task_queue.clone();
+        let selected_for_sort = selected_search.clone();
+        let render_for_sort = render_search_results.clone();
         sort_dropdown.connect_selected_notify(move |dd| {
             crate::settings::update(|s| s.default_sort_search = dd.selected().min(2));
-            let sorted = Self::filter_and_sort_packages(&packages_clone2.borrow(), "", dd.selected());
-            Self::update_package_list(&list_box_clone2.borrow(), &sorted, true, task_queue_clone2.clone());
+            let sorted =
+                Self::filter_and_sort_packages(&packages_clone2.borrow(), "", dd.selected());
+            selected_for_sort.borrow_mut().clear();
+            while let Some(child) = list_box_clone2.borrow().first_child() {
+                list_box_clone2.borrow().remove(&child);
+            }
+            render_for_sort(&sorted);
         });
 
         (vbox, packages, list_box_rc)
@@ -1580,6 +2174,7 @@ impl ParuGui {
         Rc<RefCell<Vec<Package>>>,
         Rc<RefCell<ListBox>>,
         Rc<RefCell<SearchEntry>>,
+        Rc<dyn Fn()>,
     ) {
         let vbox = Box::new(Orientation::Vertical, 16);
         vbox.set_margin_start(20);
@@ -1624,6 +2219,20 @@ impl ParuGui {
         sort_dropdown.set_selected(crate::settings::get().default_sort_installed.min(2));
         controls_box.append(&sort_dropdown);
 
+        let selected_label = Label::new(Some("0 selected"));
+        selected_label.add_css_class("caption");
+        selected_label.add_css_class("dim-label");
+        controls_box.append(&selected_label);
+
+        let clear_selected_btn = Button::with_label("Clear Selection");
+        clear_selected_btn.add_css_class("flat");
+        controls_box.append(&clear_selected_btn);
+
+        let remove_selected_btn = Button::with_label("Remove Selected");
+        remove_selected_btn.add_css_class("destructive-action");
+        remove_selected_btn.set_sensitive(false);
+        controls_box.append(&remove_selected_btn);
+
         vbox.append(&controls_box);
 
         let scrolled = ScrolledWindow::new();
@@ -1632,11 +2241,13 @@ impl ParuGui {
         let list_box = ListBox::new();
         list_box.add_css_class("boxed-list");
         scrolled.set_child(Some(&list_box));
-        vbox.append(&scrolled);
 
-        let packages = Rc::new(RefCell::new(Vec::new()));
+        let packages = Rc::new(RefCell::new(Vec::<Package>::new()));
         let list_box_rc = Rc::new(RefCell::new(list_box));
         let search_entry_rc = Rc::new(RefCell::new(search_entry.clone()));
+        let selected_installed: Rc<RefCell<HashSet<String>>> =
+            Rc::new(RefCell::new(HashSet::new()));
+        let selected_label_rc = Rc::new(RefCell::new(selected_label));
 
         // Handlers
         let list_box_clone = list_box_rc.clone();
@@ -1645,6 +2256,9 @@ impl ParuGui {
         let count_clone = count_label_rc.clone();
         let search_entry_clone = search_entry.clone();
         let sort_dropdown_clone = sort_dropdown.clone();
+        let selected_for_render = selected_installed.clone();
+        let selected_label_for_render = selected_label_rc.clone();
+        let remove_btn_for_render = remove_selected_btn.clone();
 
         // Common update function logic
         let update_view = Rc::new(move || {
@@ -1659,10 +2273,13 @@ impl ParuGui {
                 filtered.len(),
                 all_packages.len()
             ));
-            Self::update_package_list_with_remove(
+            Self::update_package_list_with_remove_selectable(
                 &list_box_clone.borrow(),
                 &filtered,
                 task_queue_clone.clone(),
+                selected_for_render.clone(),
+                selected_label_for_render.clone(),
+                remove_btn_for_render.clone(),
             );
         });
 
@@ -1679,12 +2296,92 @@ impl ParuGui {
             update_2();
         });
 
-        (vbox, packages, list_box_rc, search_entry_rc)
+        {
+            let selected = selected_installed.clone();
+            let label = selected_label_rc.clone();
+            let remove_btn = remove_selected_btn.clone();
+            let refresh = update_view.clone();
+            clear_selected_btn.connect_clicked(move |_| {
+                selected.borrow_mut().clear();
+                label.borrow().set_text("0 selected");
+                remove_btn.set_sensitive(false);
+                refresh();
+            });
+        }
+
+        {
+            let selected = selected_installed.clone();
+            let all_packages = packages.clone();
+            let tq = task_queue.clone();
+            let refresh = update_view.clone();
+            remove_selected_btn.connect_clicked(move |btn| {
+                let chosen = selected.borrow().clone();
+                let selected_names: Vec<String> = all_packages
+                    .borrow()
+                    .iter()
+                    .filter(|p| chosen.contains(&p.name))
+                    .map(|p| p.name.clone())
+                    .collect();
+                if selected_names.is_empty() {
+                    return;
+                }
+                let selected_count = selected_names.len();
+                let to_remove = selected_names.clone();
+
+                let queue_remove = {
+                    let selected = selected.clone();
+                    let refresh = refresh.clone();
+                    let tq = tq.clone();
+                    move || {
+                        for name in &to_remove {
+                            tq.add_task(TaskType::Remove, name.clone());
+                        }
+                        selected.borrow_mut().clear();
+                        refresh();
+                    }
+                };
+
+                let needs_confirm = crate::settings::get().confirm_batch_remove
+                    || crate::settings::get().confirm_remove
+                    || crate::settings::get().confirm_actions;
+                if needs_confirm {
+                    if let Some(window) = btn.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
+                    {
+                        Self::show_confirmation_dialog(
+                            &window,
+                            "Confirm Batch Removal",
+                            &format!("Remove {} selected packages?", selected_count),
+                            queue_remove,
+                        );
+                    }
+                } else {
+                    queue_remove();
+                }
+            });
+        }
+
+        let update_view_export: Rc<dyn Fn()> = {
+            let update_view = update_view.clone();
+            Rc::new(move || update_view())
+        };
+
+        (
+            vbox,
+            packages,
+            list_box_rc,
+            search_entry_rc,
+            update_view_export,
+        )
     }
 
     fn create_updates_view(
         task_queue: Arc<TaskQueue>,
-    ) -> (Box, Rc<RefCell<Vec<Package>>>, Rc<RefCell<ListBox>>) {
+    ) -> (
+        Box,
+        Rc<RefCell<Vec<Package>>>,
+        Rc<RefCell<ListBox>>,
+        Rc<dyn Fn()>,
+    ) {
         let vbox = Box::new(Orientation::Vertical, 16);
         vbox.set_margin_start(20);
         vbox.set_margin_end(20);
@@ -1701,8 +2398,19 @@ impl ParuGui {
         let title = Label::new(Some("Available Updates"));
         title.add_css_class("title-2");
         title.set_halign(gtk4::Align::Start);
-        title.set_hexpand(true);
+        title.set_hexpand(false);
         header_box.append(&title);
+
+        let count_label = Label::new(Some("0 updates"));
+        count_label.add_css_class("badge");
+        count_label.set_hexpand(true);
+        count_label.set_halign(gtk4::Align::Start);
+        header_box.append(&count_label);
+
+        let selected_label = Label::new(Some("0 selected"));
+        selected_label.add_css_class("caption");
+        selected_label.add_css_class("dim-label");
+        header_box.append(&selected_label);
 
         let update_box = Box::new(Orientation::Horizontal, 8);
         let update_icon = Image::from_icon_name("software-update-available-symbolic");
@@ -1714,6 +2422,13 @@ impl ParuGui {
         update_all_btn.set_child(Some(&update_box));
         update_all_btn.add_css_class("suggested-action");
         update_all_btn.set_tooltip_text(Some("Update all packages to their latest versions"));
+
+        let update_selected_btn = Button::with_label("Update Selected");
+        update_selected_btn.add_css_class("suggested-action");
+        update_selected_btn.set_sensitive(false);
+
+        let clear_selection_btn = Button::with_label("Clear Selection");
+        clear_selection_btn.add_css_class("flat");
 
         let task_queue_clone = task_queue.clone();
         update_all_btn.connect_clicked(move |btn| {
@@ -1738,6 +2453,8 @@ impl ParuGui {
             }
         });
 
+        header_box.append(&clear_selection_btn);
+        header_box.append(&update_selected_btn);
         header_box.append(&update_all_btn);
         vbox.append(&header_box);
 
@@ -1767,12 +2484,361 @@ impl ParuGui {
         let list_box = ListBox::new();
         list_box.add_css_class("boxed-list");
         scrolled.set_child(Some(&list_box));
+
+        let packages = Rc::new(RefCell::new(Vec::<Package>::new()));
+        let list_box_rc = Rc::new(RefCell::new(list_box));
+        let selected_updates: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+
+        let controls_box = Box::new(Orientation::Horizontal, 8);
+        controls_box.set_margin_top(8);
+
+        let filter_entry = SearchEntry::new();
+        filter_entry.set_placeholder_text(Some("Filter updates..."));
+        filter_entry.set_hexpand(true);
+        controls_box.append(&filter_entry);
+
+        let source_model = StringList::new(&["All", "Repo Only", "AUR Only"]);
+        let source_dropdown = DropDown::new(Some(source_model), None::<gtk4::Expression>);
+        source_dropdown.set_selected(
+            match crate::settings::get().show_only_updates_from.as_str() {
+                "repo-only" => 1,
+                "aur-only" => 2,
+                _ => 0,
+            },
+        );
+        controls_box.append(&source_dropdown);
+
+        let sort_model = StringList::new(&["Name (A-Z)", "Name (Z-A)", "Repository"]);
+        let sort_dropdown = DropDown::new(Some(sort_model), None::<gtk4::Expression>);
+        sort_dropdown.set_selected(0);
+        controls_box.append(&sort_dropdown);
+        vbox.append(&controls_box);
         vbox.append(&scrolled);
 
-        let packages = Rc::new(RefCell::new(Vec::new()));
-        let list_box_rc = Rc::new(RefCell::new(list_box));
+        let selected_label_rc = Rc::new(RefCell::new(selected_label));
+        let count_label_rc = Rc::new(RefCell::new(count_label));
 
-        (vbox, packages, list_box_rc)
+        let render_list: Rc<dyn Fn()> = {
+            let list_box = list_box_rc.clone();
+            let packages = packages.clone();
+            let selected_updates = selected_updates.clone();
+            let filter_entry = filter_entry.clone();
+            let source_dropdown = source_dropdown.clone();
+            let sort_dropdown = sort_dropdown.clone();
+            let task_queue = task_queue.clone();
+            let selected_label = selected_label_rc.clone();
+            let update_selected_btn = update_selected_btn.clone();
+            let count_label = count_label_rc.clone();
+
+            Rc::new(move || {
+                let query = filter_entry.text().to_string().to_lowercase();
+
+                let mut filtered: Vec<Package> = packages
+                    .borrow()
+                    .iter()
+                    .filter(|pkg| {
+                        if query.is_empty() {
+                            true
+                        } else {
+                            pkg.name.to_lowercase().contains(&query)
+                                || pkg.description.to_lowercase().contains(&query)
+                        }
+                    })
+                    .cloned()
+                    .collect();
+
+                filtered = match source_dropdown.selected() {
+                    1 => filtered
+                        .into_iter()
+                        .filter(|p| p.repository != "aur")
+                        .collect::<Vec<_>>(),
+                    2 => filtered
+                        .into_iter()
+                        .filter(|p| p.repository == "aur")
+                        .collect::<Vec<_>>(),
+                    _ => filtered,
+                };
+
+                match sort_dropdown.selected() {
+                    1 => filtered.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase())),
+                    2 => filtered.sort_by(|a, b| {
+                        a.repository
+                            .to_lowercase()
+                            .cmp(&b.repository.to_lowercase())
+                            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                    }),
+                    _ => filtered.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                }
+
+                let list_box = list_box.borrow();
+                while let Some(child) = list_box.first_child() {
+                    list_box.remove(&child);
+                }
+
+                if filtered.is_empty() {
+                    let empty_box = Box::new(Orientation::Vertical, 12);
+                    empty_box.set_margin_top(48);
+                    empty_box.set_margin_bottom(48);
+                    empty_box.set_halign(gtk4::Align::Center);
+                    let empty_icon = Image::from_icon_name("software-update-available-symbolic");
+                    empty_icon.set_pixel_size(64);
+                    empty_icon.add_css_class("dim-label");
+                    empty_box.append(&empty_icon);
+                    let empty = Label::new(Some("No updates match current filters"));
+                    empty.add_css_class("dim-label");
+                    empty_box.append(&empty);
+                    list_box.append(&empty_box);
+                } else {
+                    for pkg in &filtered {
+                        let row = Self::create_update_row(
+                            pkg,
+                            task_queue.clone(),
+                            selected_updates.clone(),
+                            selected_label.clone(),
+                            update_selected_btn.clone(),
+                        );
+                        list_box.append(&row);
+                    }
+                }
+
+                // Cleanup stale selections
+                {
+                    let visible: HashSet<String> = filtered
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect::<HashSet<_>>();
+                    selected_updates
+                        .borrow_mut()
+                        .retain(|name| visible.contains(name));
+                }
+
+                let selected_count = selected_updates.borrow().len();
+                selected_label
+                    .borrow()
+                    .set_text(&format!("{} selected", selected_count));
+                update_selected_btn.set_sensitive(selected_count > 0);
+                count_label
+                    .borrow()
+                    .set_text(&format!("{} updates", filtered.len()));
+            })
+        };
+
+        {
+            let render = render_list.clone();
+            filter_entry.connect_search_changed(move |_| render());
+        }
+        {
+            let render = render_list.clone();
+            source_dropdown.connect_selected_notify(move |dd| {
+                let value = match dd.selected() {
+                    1 => "repo-only",
+                    2 => "aur-only",
+                    _ => "all",
+                };
+                crate::settings::update(|s| s.show_only_updates_from = value.to_string());
+                render();
+            });
+        }
+        {
+            let render = render_list.clone();
+            sort_dropdown.connect_selected_notify(move |_| render());
+        }
+        {
+            let selected_updates = selected_updates.clone();
+            let render = render_list.clone();
+            clear_selection_btn.connect_clicked(move |_| {
+                selected_updates.borrow_mut().clear();
+                render();
+            });
+        }
+        {
+            let selected_updates = selected_updates.clone();
+            let task_queue = task_queue.clone();
+            let render = render_list.clone();
+            update_selected_btn.connect_clicked(move |_| {
+                let selected = selected_updates
+                    .borrow()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for pkg in selected {
+                    task_queue.add_task(TaskType::UpdatePackage, pkg);
+                }
+                selected_updates.borrow_mut().clear();
+                render();
+            });
+        }
+
+        (vbox, packages, list_box_rc, render_list)
+    }
+
+    fn create_watchlist_view(
+        task_queue: Arc<TaskQueue>,
+        installed_packages: Rc<RefCell<Vec<Package>>>,
+        updates: Rc<RefCell<Vec<Package>>>,
+    ) -> (Box, Rc<dyn Fn()>) {
+        let vbox = Box::new(Orientation::Vertical, 16);
+        vbox.set_margin_start(20);
+        vbox.set_margin_end(20);
+        vbox.set_margin_top(16);
+        vbox.set_margin_bottom(16);
+
+        let header = Box::new(Orientation::Horizontal, 12);
+        let icon = Image::from_icon_name("starred-symbolic");
+        icon.set_pixel_size(24);
+        header.append(&icon);
+
+        let title = Label::new(Some("Watchlist"));
+        title.add_css_class("title-2");
+        header.append(&title);
+
+        let count_label = Label::new(Some("0 items"));
+        count_label.add_css_class("badge");
+        count_label.set_hexpand(true);
+        count_label.set_halign(gtk4::Align::Start);
+        header.append(&count_label);
+
+        vbox.append(&header);
+
+        let scrolled = ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        let list_box = ListBox::new();
+        list_box.add_css_class("boxed-list");
+        scrolled.set_child(Some(&list_box));
+        vbox.append(&scrolled);
+
+        let list_box_rc = Rc::new(RefCell::new(list_box));
+        let count_label_rc = Rc::new(RefCell::new(count_label));
+
+        let render_watchlist: Rc<dyn Fn()> = {
+            let list_box = list_box_rc.clone();
+            let count_label = count_label_rc.clone();
+            let installed_packages = installed_packages.clone();
+            let updates = updates.clone();
+            let task_queue = task_queue.clone();
+
+            Rc::new(move || {
+                let favorites = crate::data_store::favorites();
+                count_label
+                    .borrow()
+                    .set_text(&format!("{} items", favorites.len()));
+
+                let list_box = list_box.borrow();
+                while let Some(child) = list_box.first_child() {
+                    list_box.remove(&child);
+                }
+
+                if favorites.is_empty() {
+                    let empty_box = Box::new(Orientation::Vertical, 12);
+                    empty_box.set_margin_top(48);
+                    empty_box.set_margin_bottom(48);
+                    empty_box.set_halign(gtk4::Align::Center);
+                    let empty_icon = Image::from_icon_name("starred-symbolic");
+                    empty_icon.set_pixel_size(64);
+                    empty_icon.add_css_class("dim-label");
+                    empty_box.append(&empty_icon);
+                    let msg = Label::new(Some("No watched packages yet"));
+                    msg.add_css_class("dim-label");
+                    empty_box.append(&msg);
+                    list_box.append(&empty_box);
+                    return;
+                }
+
+                let installed = installed_packages.borrow();
+                let updates = updates.borrow();
+
+                for pkg_name in favorites {
+                    let installed_pkg = installed.iter().find(|p| p.name == pkg_name);
+                    let update_pkg = updates.iter().find(|p| p.name == pkg_name);
+
+                    let row = Box::new(Orientation::Horizontal, 12);
+                    row.add_css_class("package-row");
+                    row.set_margin_start(16);
+                    row.set_margin_end(16);
+                    row.set_margin_top(12);
+                    row.set_margin_bottom(12);
+
+                    let icon = Image::from_icon_name("starred-symbolic");
+                    icon.set_pixel_size(28);
+                    row.append(&icon);
+
+                    let info = Box::new(Orientation::Vertical, 4);
+                    info.set_hexpand(true);
+
+                    let name = Label::new(Some(&pkg_name));
+                    name.add_css_class("heading");
+                    name.set_halign(gtk4::Align::Start);
+                    info.append(&name);
+
+                    let status = if let Some(upd) = update_pkg {
+                        let old = upd
+                            .installed_version
+                            .clone()
+                            .unwrap_or_else(|| "?".to_string());
+                        format!("Update available: {} -> {}", old, upd.version)
+                    } else if let Some(inst) = installed_pkg {
+                        format!("Installed: {}", inst.version)
+                    } else {
+                        "Not installed".to_string()
+                    };
+                    let status_label = Label::new(Some(&status));
+                    status_label.add_css_class("dim-label");
+                    status_label.set_halign(gtk4::Align::Start);
+                    info.append(&status_label);
+
+                    row.append(&info);
+
+                    let actions = Box::new(Orientation::Horizontal, 8);
+                    let details_btn = Button::with_label("Details");
+                    let name_for_details = pkg_name.clone();
+                    let row_weak = row.downgrade();
+                    details_btn.connect_clicked(move |_| {
+                        if let Some(r) = row_weak.upgrade() {
+                            if let Some(window) =
+                                r.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
+                            {
+                                Self::show_package_details_dialog(&window, &name_for_details);
+                            }
+                        }
+                    });
+                    actions.append(&details_btn);
+
+                    if update_pkg.is_some() {
+                        let update_btn = Button::with_label("Update");
+                        update_btn.add_css_class("suggested-action");
+                        let name_for_update = pkg_name.clone();
+                        let tq = task_queue.clone();
+                        update_btn.connect_clicked(move |_| {
+                            tq.add_task(TaskType::UpdatePackage, name_for_update.clone());
+                        });
+                        actions.append(&update_btn);
+                    }
+
+                    let unwatch = Button::with_label("Unwatch");
+                    let name_for_unwatch = pkg_name.clone();
+                    unwatch.connect_clicked(move |_| {
+                        if crate::data_store::is_favorite(&name_for_unwatch) {
+                            let _ = crate::data_store::toggle_favorite(&name_for_unwatch);
+                        }
+                    });
+                    actions.append(&unwatch);
+
+                    row.append(&actions);
+                    list_box.append(&row);
+                }
+            })
+        };
+
+        render_watchlist();
+        {
+            let refresh = render_watchlist.clone();
+            glib::timeout_add_seconds_local(2, move || {
+                refresh();
+                glib::ControlFlow::Continue
+            });
+        }
+
+        (vbox, render_watchlist)
     }
 
     fn update_package_list(
@@ -1809,6 +2875,25 @@ impl ParuGui {
             let row = Self::create_package_row(package, show_actions, task_queue.clone());
             list_box.append(&row);
         }
+    }
+
+    fn create_favorite_button(package_name: &str) -> Button {
+        let favorite_btn = Button::with_label(if crate::data_store::is_favorite(package_name) {
+            "★"
+        } else {
+            "☆"
+        });
+        favorite_btn.add_css_class("flat");
+        favorite_btn.add_css_class("circular");
+        favorite_btn.set_tooltip_text(Some("Toggle watchlist"));
+
+        let pkg_name = package_name.to_string();
+        favorite_btn.connect_clicked(move |btn| {
+            let enabled = crate::data_store::toggle_favorite(&pkg_name);
+            btn.set_label(if enabled { "★" } else { "☆" });
+        });
+
+        favorite_btn
     }
 
     fn create_package_row(
@@ -1881,6 +2966,15 @@ impl ParuGui {
         };
 
         info_box.append(&version_box);
+        if crate::settings::get().show_package_sizes_in_lists {
+            if let Some(size_text) = Self::query_package_size_text(&package.name) {
+                let size_label = Label::new(Some(&size_text));
+                size_label.add_css_class("caption");
+                size_label.add_css_class("dim-label");
+                size_label.set_halign(gtk4::Align::Start);
+                info_box.append(&size_label);
+            }
+        }
 
         // Description
         if !package.description.is_empty() {
@@ -1902,7 +2996,8 @@ impl ParuGui {
             click.set_button(1);
             click.connect_released(move |_, _, _, _| {
                 if let Some(info) = info_box_weak.upgrade() {
-                    if let Some(window) = info.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
+                    if let Some(window) =
+                        info.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
                     {
                         Self::show_package_details_dialog(&window, &pkg_name_click);
                     }
@@ -1915,6 +3010,9 @@ impl ParuGui {
 
         if show_actions {
             let action_box = Box::new(Orientation::Horizontal, 8);
+
+            let favorite_btn = Self::create_favorite_button(&package.name);
+            action_box.append(&favorite_btn);
 
             let info_icon = Image::from_icon_name("dialog-information-symbolic");
             let info_btn = Button::new();
@@ -1946,12 +3044,13 @@ impl ParuGui {
                 let pkg_name = package.name.clone();
                 let row_box_weak = row_box.downgrade();
                 remove_btn.connect_clicked(move |_| {
-                    let needs_confirm =
-                        crate::settings::get().confirm_remove || crate::settings::get().confirm_actions;
+                    let needs_confirm = crate::settings::get().confirm_remove
+                        || crate::settings::get().confirm_actions;
                     if needs_confirm {
                         if let Some(row_box) = row_box_weak.upgrade() {
-                            if let Some(window) =
-                                row_box.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
+                            if let Some(window) = row_box
+                                .root()
+                                .and_then(|w| w.downcast::<gtk4::Window>().ok())
                             {
                                 let tq = task_queue.clone();
                                 let pkg = pkg_name.clone();
@@ -1960,7 +3059,10 @@ impl ParuGui {
                                     "Confirm Package Removal",
                                     &format!("Remove package '{}'?", pkg_name),
                                     move || {
-                                        log_info(&format!("Adding remove task for package: {}", pkg));
+                                        log_info(&format!(
+                                            "Adding remove task for package: {}",
+                                            pkg
+                                        ));
                                         tq.add_task(TaskType::Remove, pkg.clone());
                                     },
                                 );
@@ -2008,6 +3110,9 @@ impl ParuGui {
             // For updates view or others where show_actions is false, we still want details
             let action_box = Box::new(Orientation::Horizontal, 8);
 
+            let favorite_btn = Self::create_favorite_button(&package.name);
+            action_box.append(&favorite_btn);
+
             let info_icon = Image::from_icon_name("dialog-information-symbolic");
             let info_btn = Button::new();
             info_btn.set_child(Some(&info_icon));
@@ -2028,6 +3133,206 @@ impl ParuGui {
             action_box.append(&info_btn);
             row_box.append(&action_box);
         }
+
+        row_box
+    }
+
+    fn create_update_row(
+        package: &Package,
+        task_queue: Arc<TaskQueue>,
+        selected_updates: Rc<RefCell<HashSet<String>>>,
+        selected_label: Rc<RefCell<Label>>,
+        update_selected_btn: Button,
+    ) -> Box {
+        let row_box = Box::new(Orientation::Horizontal, 12);
+        row_box.add_css_class("package-row");
+        row_box.set_margin_start(16);
+        row_box.set_margin_end(16);
+        row_box.set_margin_top(12);
+        row_box.set_margin_bottom(12);
+
+        let select_btn = CheckButton::new();
+        select_btn.set_active(selected_updates.borrow().contains(&package.name));
+        let name_for_select = package.name.clone();
+        let selected_updates_clone = selected_updates.clone();
+        let selected_label_for_select = selected_label.clone();
+        let update_selected_for_select = update_selected_btn.clone();
+        select_btn.connect_toggled(move |btn| {
+            if btn.is_active() {
+                selected_updates_clone
+                    .borrow_mut()
+                    .insert(name_for_select.clone());
+            } else {
+                selected_updates_clone.borrow_mut().remove(&name_for_select);
+            }
+            let selected_count = selected_updates_clone.borrow().len();
+            selected_label_for_select
+                .borrow()
+                .set_text(&format!("{} selected", selected_count));
+            update_selected_for_select.set_sensitive(selected_count > 0);
+        });
+        row_box.append(&select_btn);
+
+        let pkg_icon = Image::from_icon_name("software-update-available-symbolic");
+        pkg_icon.set_pixel_size(28);
+        pkg_icon.add_css_class("dim-label");
+        row_box.append(&pkg_icon);
+
+        let info_box = Box::new(Orientation::Vertical, 4);
+        info_box.set_hexpand(true);
+
+        let name_box = Box::new(Orientation::Horizontal, 8);
+        let name_label = Label::new(Some(&package.name));
+        name_label.add_css_class("heading");
+        name_label.set_halign(gtk4::Align::Start);
+        name_box.append(&name_label);
+
+        let repo_label = Label::new(Some(&package.repository));
+        repo_label.add_css_class("repo-tag");
+        match package.repository.as_str() {
+            "aur" => repo_label.add_css_class("repo-tag-aur"),
+            "core" | "core-testing" => repo_label.add_css_class("repo-tag-core"),
+            "extra" | "extra-testing" => repo_label.add_css_class("repo-tag-extra"),
+            "community" | "multilib" => repo_label.add_css_class("repo-tag-community"),
+            _ => {}
+        }
+        name_box.append(&repo_label);
+        info_box.append(&name_box);
+
+        let versions = Box::new(Orientation::Horizontal, 8);
+        if let Some(installed) = &package.installed_version {
+            let old = Label::new(Some(installed));
+            old.add_css_class("version-badge");
+            versions.append(&old);
+
+            let arrow = Label::new(Some("→"));
+            arrow.add_css_class("version-update");
+            versions.append(&arrow);
+        }
+        let new_ver = Label::new(Some(&package.version));
+        new_ver.add_css_class("version-badge");
+        new_ver.add_css_class("version-update");
+        versions.append(&new_ver);
+        info_box.append(&versions);
+        if crate::settings::get().show_package_sizes_in_lists {
+            if let Some(size_text) = Self::query_package_size_text(&package.name) {
+                let size_label = Label::new(Some(&size_text));
+                size_label.add_css_class("caption");
+                size_label.add_css_class("dim-label");
+                size_label.set_halign(gtk4::Align::Start);
+                info_box.append(&size_label);
+            }
+        }
+
+        row_box.append(&info_box);
+
+        let action_box = Box::new(Orientation::Horizontal, 8);
+
+        let favorite_btn = Self::create_favorite_button(&package.name);
+        action_box.append(&favorite_btn);
+
+        let info_btn = Button::new();
+        info_btn.set_child(Some(&Image::from_icon_name("dialog-information-symbolic")));
+        info_btn.add_css_class("flat");
+        info_btn.add_css_class("circular");
+        info_btn.set_tooltip_text(Some("View details"));
+        let pkg_for_info = package.name.clone();
+        let row_weak = row_box.downgrade();
+        info_btn.connect_clicked(move |_| {
+            if let Some(row) = row_weak.upgrade() {
+                if let Some(window) = row.root().and_then(|w| w.downcast::<gtk4::Window>().ok()) {
+                    Self::show_package_details_dialog(&window, &pkg_for_info);
+                }
+            }
+        });
+        action_box.append(&info_btn);
+
+        let is_ignored = crate::settings::get()
+            .ignored_updates
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(&package.name));
+        let ignore_btn = Button::with_label(if is_ignored { "Unignore" } else { "Ignore" });
+        ignore_btn.add_css_class("flat");
+        let pkg_for_ignore = package.name.clone();
+        let selected_updates_for_ignore = selected_updates.clone();
+        let selected_label_for_ignore = selected_label.clone();
+        let update_selected_for_ignore = update_selected_btn.clone();
+        let row_weak_ignore = row_box.downgrade();
+        ignore_btn.connect_clicked(move |btn| {
+            let now_ignored = crate::settings::update_and_get(|s| {
+                let exists = s
+                    .ignored_updates
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(&pkg_for_ignore));
+                if exists {
+                    s.ignored_updates
+                        .retain(|p| !p.eq_ignore_ascii_case(&pkg_for_ignore));
+                    false
+                } else {
+                    s.ignored_updates.push(pkg_for_ignore.clone());
+                    s.ignored_updates.sort();
+                    s.ignored_updates.dedup();
+                    true
+                }
+            })
+            .unwrap_or(false);
+
+            if now_ignored {
+                selected_updates_for_ignore
+                    .borrow_mut()
+                    .remove(&pkg_for_ignore);
+                let count = selected_updates_for_ignore.borrow().len();
+                selected_label_for_ignore
+                    .borrow()
+                    .set_text(&format!("{} selected", count));
+                update_selected_for_ignore.set_sensitive(count > 0);
+                if let Some(row) = row_weak_ignore.upgrade() {
+                    row.set_visible(false);
+                }
+            } else {
+                btn.set_label("Ignore");
+            }
+        });
+        action_box.append(&ignore_btn);
+
+        let update_btn = Button::with_label("Update");
+        update_btn.add_css_class("suggested-action");
+        let pkg_for_update = package.name.clone();
+        update_btn.connect_clicked(move |_| {
+            task_queue.add_task(TaskType::UpdatePackage, pkg_for_update.clone());
+        });
+        action_box.append(&update_btn);
+
+        row_box.append(&action_box);
+        row_box
+    }
+
+    fn create_search_row(
+        package: &Package,
+        task_queue: Arc<TaskQueue>,
+        selected: Rc<RefCell<HashSet<String>>>,
+        selected_label: Rc<RefCell<Label>>,
+        install_selected_btn: Button,
+    ) -> Box {
+        let row_box = Self::create_package_row(package, true, task_queue);
+
+        let select_btn = CheckButton::new();
+        select_btn.set_active(selected.borrow().contains(&package.name));
+        let pkg_name = package.name.clone();
+        let selected_clone = selected.clone();
+        select_btn.connect_toggled(move |btn| {
+            if btn.is_active() {
+                selected_clone.borrow_mut().insert(pkg_name.clone());
+            } else {
+                selected_clone.borrow_mut().remove(&pkg_name);
+            }
+            let count = selected_clone.borrow().len();
+            selected_label
+                .borrow()
+                .set_text(&format!("{} selected", count));
+            install_selected_btn.set_sensitive(count > 0);
+        });
+        row_box.prepend(&select_btn);
 
         row_box
     }
@@ -2065,6 +3370,68 @@ impl ParuGui {
             let row = Self::create_package_row_with_remove(package, task_queue.clone());
             list_box.append(&row);
         }
+    }
+
+    fn update_package_list_with_remove_selectable(
+        list_box: &ListBox,
+        packages: &[Package],
+        task_queue: Arc<TaskQueue>,
+        selected: Rc<RefCell<HashSet<String>>>,
+        selected_label: Rc<RefCell<Label>>,
+        remove_selected_btn: Button,
+    ) {
+        while let Some(child) = list_box.first_child() {
+            list_box.remove(&child);
+        }
+
+        if packages.is_empty() {
+            let empty_box = Box::new(Orientation::Vertical, 12);
+            empty_box.set_margin_top(48);
+            empty_box.set_margin_bottom(48);
+            empty_box.set_halign(gtk4::Align::Center);
+
+            let empty_icon = Image::from_icon_name("package-x-generic-symbolic");
+            empty_icon.set_pixel_size(64);
+            empty_icon.add_css_class("dim-label");
+            empty_box.append(&empty_icon);
+
+            let empty_label = Label::new(Some("No packages found"));
+            empty_label.add_css_class("dim-label");
+            empty_box.append(&empty_label);
+
+            list_box.append(&empty_box);
+            return;
+        }
+
+        for package in packages {
+            let row = Self::create_package_row_with_remove(package, task_queue.clone());
+            let select_btn = CheckButton::new();
+            select_btn.set_active(selected.borrow().contains(&package.name));
+            let pkg_name = package.name.clone();
+            let selected_clone = selected.clone();
+            let selected_label_clone = selected_label.clone();
+            let remove_btn_clone = remove_selected_btn.clone();
+            select_btn.connect_toggled(move |btn| {
+                if btn.is_active() {
+                    selected_clone.borrow_mut().insert(pkg_name.clone());
+                } else {
+                    selected_clone.borrow_mut().remove(&pkg_name);
+                }
+                let count = selected_clone.borrow().len();
+                selected_label_clone
+                    .borrow()
+                    .set_text(&format!("{} selected", count));
+                remove_btn_clone.set_sensitive(count > 0);
+            });
+            row.prepend(&select_btn);
+            list_box.append(&row);
+        }
+
+        let selected_count = selected.borrow().len();
+        selected_label
+            .borrow()
+            .set_text(&format!("{} selected", selected_count));
+        remove_selected_btn.set_sensitive(selected_count > 0);
     }
 
     fn create_package_row_with_remove(package: &Package, task_queue: Arc<TaskQueue>) -> Box {
@@ -2112,6 +3479,15 @@ impl ParuGui {
         version_label.add_css_class("version-badge");
         version_label.set_halign(gtk4::Align::Start);
         info_box.append(&version_label);
+        if crate::settings::get().show_package_sizes_in_lists {
+            if let Some(size_text) = Self::query_package_size_text(&package.name) {
+                let size_label = Label::new(Some(&size_text));
+                size_label.add_css_class("caption");
+                size_label.add_css_class("dim-label");
+                size_label.set_halign(gtk4::Align::Start);
+                info_box.append(&size_label);
+            }
+        }
 
         if crate::settings::get().show_package_details_on_single_click {
             let pkg_name_click = package.name.clone();
@@ -2120,7 +3496,8 @@ impl ParuGui {
             click.set_button(1);
             click.connect_released(move |_, _, _, _| {
                 if let Some(info) = info_box_weak.upgrade() {
-                    if let Some(window) = info.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
+                    if let Some(window) =
+                        info.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
                     {
                         Self::show_package_details_dialog(&window, &pkg_name_click);
                     }
@@ -2133,6 +3510,9 @@ impl ParuGui {
 
         // Remove button
         let action_box = Box::new(Orientation::Horizontal, 8);
+
+        let favorite_btn = Self::create_favorite_button(&package.name);
+        action_box.append(&favorite_btn);
 
         // Info button
         let info_icon = Image::from_icon_name("dialog-information-symbolic");
@@ -2167,7 +3547,9 @@ impl ParuGui {
                 crate::settings::get().confirm_remove || crate::settings::get().confirm_actions;
             if needs_confirm {
                 if let Some(row_box) = row_box_weak2.upgrade() {
-                    if let Some(window) = row_box.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
+                    if let Some(window) = row_box
+                        .root()
+                        .and_then(|w| w.downcast::<gtk4::Window>().ok())
                     {
                         let tq = task_queue.clone();
                         let pkg = pkg_name.clone();
@@ -2198,19 +3580,42 @@ impl ParuGui {
         list_box: &Rc<RefCell<ListBox>>,
         packages: &Rc<RefCell<Vec<Package>>>,
         task_queue: Arc<TaskQueue>,
+        render_installed: Option<Rc<dyn Fn()>>,
+        refresh_label: Option<Rc<RefCell<Label>>>,
+        refresh_timer: Option<Rc<RefCell<Option<glib::SourceId>>>>,
     ) {
         let list_box = list_box.clone();
         let packages = packages.clone();
+        let render_installed = render_installed.clone();
+        let refresh_label_ok = refresh_label.clone();
+        let refresh_timer_ok = refresh_timer.clone();
+        let refresh_label_err = refresh_label;
+        let refresh_timer_err = refresh_timer;
 
         Self::run_blocking(
             move || ParuBackend::list_installed(),
             move |result| match result {
                 Ok(pkgs) => {
+                    crate::data_store::set_cached_installed(&pkgs);
                     *packages.borrow_mut() = pkgs.clone();
-                    Self::update_package_list_with_remove(&list_box.borrow(), &pkgs, task_queue);
+                    if let Some(render) = &render_installed {
+                        render();
+                    } else {
+                        Self::update_package_list_with_remove(
+                            &list_box.borrow(),
+                            &pkgs,
+                            task_queue,
+                        );
+                    }
+                    if let (Some(label), Some(timer)) = (refresh_label_ok, refresh_timer_ok) {
+                        Self::update_refresh_time_from_cache(&label, &timer);
+                    }
                 }
                 Err(e) => {
                     log_error(&format!("Error loading installed packages: {}", e));
+                    if let (Some(label), Some(timer)) = (refresh_label_err, refresh_timer_err) {
+                        Self::set_refresh_stale_warning(&label, &timer, &e);
+                    }
                 }
             },
         );
@@ -2220,9 +3625,17 @@ impl ParuGui {
         list_box: &Rc<RefCell<ListBox>>,
         packages: &Rc<RefCell<Vec<Package>>>,
         task_queue: Arc<TaskQueue>,
+        render_updates: Option<Rc<dyn Fn()>>,
+        refresh_label: Option<Rc<RefCell<Label>>>,
+        refresh_timer: Option<Rc<RefCell<Option<glib::SourceId>>>>,
     ) {
         let list_box = list_box.clone();
         let packages = packages.clone();
+        let render_updates_cloned = render_updates.clone();
+        let refresh_label_ok = refresh_label.clone();
+        let refresh_timer_ok = refresh_timer.clone();
+        let refresh_label_err = refresh_label;
+        let refresh_timer_err = refresh_timer;
 
         Self::run_blocking(
             move || ParuBackend::list_updates(),
@@ -2239,58 +3652,147 @@ impl ParuGui {
                             ),
                         );
                     }
+                    crate::data_store::set_cached_updates(&pkgs);
                     *packages.borrow_mut() = pkgs.clone();
-                    Self::update_package_list(&list_box.borrow(), &pkgs, false, task_queue);
+                    if let Some(render) = &render_updates_cloned {
+                        render();
+                    } else {
+                        Self::update_package_list(&list_box.borrow(), &pkgs, false, task_queue);
+                    }
+                    if let (Some(label), Some(timer)) = (refresh_label_ok, refresh_timer_ok) {
+                        Self::update_refresh_time_from_cache(&label, &timer);
+                    }
                 }
                 Err(e) => {
                     log_error(&format!("Error loading updates: {}", e));
+                    if let (Some(label), Some(timer)) = (refresh_label_err, refresh_timer_err) {
+                        Self::set_refresh_stale_warning(&label, &timer, &e);
+                    }
                 }
             },
         );
     }
 
-    fn update_refresh_time(
+    fn update_refresh_time_from_cache(
         label: &Rc<RefCell<Label>>,
         timer_id: &Rc<RefCell<Option<glib::SourceId>>>,
     ) {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         if let Some(existing_id) = timer_id.borrow_mut().take() {
             existing_id.remove();
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let newest = std::cmp::max(
+            crate::data_store::cached_installed_at().unwrap_or(0),
+            crate::data_store::cached_updates_at().unwrap_or(0),
+        );
+        if newest <= 0 {
+            label.borrow().set_text("No cached data yet");
+            return;
+        }
 
         let label_clone = label.clone();
+        let newest_ts = newest;
+        label
+            .borrow()
+            .set_text(&Self::freshness_text(newest_ts, false));
 
-        // Update immediately
-        label.borrow().set_text("Refreshed just now");
-
-        // Update every 30 seconds to show elapsed time
         let id = glib::timeout_add_seconds_local(30, move || {
-            let elapsed = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(now)
-                .saturating_sub(now);
-
-            let time_str = if elapsed < 60 {
-                "Refreshed just now".to_string()
-            } else if elapsed < 3600 {
-                format!("Refreshed {} min ago", elapsed / 60)
-            } else if elapsed < 86400 {
-                format!("Refreshed {} hr ago", elapsed / 3600)
-            } else {
-                format!("Refreshed {} days ago", elapsed / 86400)
-            };
-
-            label_clone.borrow().set_text(&time_str);
+            label_clone
+                .borrow()
+                .set_text(&Self::freshness_text(newest_ts, false));
             glib::ControlFlow::Continue
         });
         *timer_id.borrow_mut() = Some(id);
+    }
+
+    fn set_refresh_stale_warning(
+        label: &Rc<RefCell<Label>>,
+        timer_id: &Rc<RefCell<Option<glib::SourceId>>>,
+        error: &str,
+    ) {
+        if let Some(existing_id) = timer_id.borrow_mut().take() {
+            existing_id.remove();
+        }
+        let newest = std::cmp::max(
+            crate::data_store::cached_installed_at().unwrap_or(0),
+            crate::data_store::cached_updates_at().unwrap_or(0),
+        );
+        if newest > 0 {
+            label.borrow().set_text(&format!(
+                "Refresh failed, showing cached data ({})",
+                Self::freshness_text(newest, true)
+            ));
+        } else {
+            label
+                .borrow()
+                .set_text(&format!("Refresh failed: {}", error));
+        }
+    }
+
+    fn freshness_text(unix_ts: i64, only_age: bool) -> String {
+        let now = chrono::Local::now().timestamp();
+        let elapsed = now.saturating_sub(unix_ts);
+        let ttl_secs = crate::settings::get().cache_ttl_minutes.saturating_mul(60) as i64;
+        let age = if elapsed < 60 {
+            "just now".to_string()
+        } else if elapsed < 3600 {
+            format!("{} min ago", elapsed / 60)
+        } else if elapsed < 86400 {
+            format!("{} hr ago", elapsed / 3600)
+        } else {
+            format!("{} days ago", elapsed / 86400)
+        };
+
+        if only_age {
+            age
+        } else if elapsed >= ttl_secs.max(60) {
+            format!("Data synced {} (stale)", age)
+        } else {
+            format!("Data synced {}", age)
+        }
+    }
+
+    fn is_cache_within_ttl(unix_ts: i64) -> bool {
+        let ttl_secs = crate::settings::get().cache_ttl_minutes.saturating_mul(60) as i64;
+        if ttl_secs == 0 {
+            return true;
+        }
+        let now = chrono::Local::now().timestamp();
+        now.saturating_sub(unix_ts) <= ttl_secs
+    }
+
+    fn query_package_size_text(package_name: &str) -> Option<String> {
+        let query = |flag: &str, key: &str| -> Option<String> {
+            let output = Command::new("pacman")
+                .arg(flag)
+                .arg(package_name)
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let line = stdout
+                .lines()
+                .find(|l| l.trim_start().starts_with(key))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, v)| v.trim().to_string())?;
+            Some(format!("Size: {}", line))
+        };
+
+        query("-Qi", "Installed Size").or_else(|| query("-Si", "Download Size"))
+    }
+
+    fn format_duration(total_secs: u64) -> String {
+        if total_secs < 60 {
+            format!("{}s", total_secs)
+        } else if total_secs < 3600 {
+            format!("{}m {}s", total_secs / 60, total_secs % 60)
+        } else {
+            let hours = total_secs / 3600;
+            let mins = (total_secs % 3600) / 60;
+            format!("{}h {}m", hours, mins)
+        }
     }
 
     fn filter_and_sort_packages(packages: &[Package], query: &str, sort_idx: u32) -> Vec<Package> {
@@ -2320,6 +3822,141 @@ impl ParuGui {
         }
 
         filtered
+    }
+
+    fn smart_search_packages(query: &str, limit: usize) -> Result<Vec<Package>, String> {
+        let direct = ParuBackend::search_packages(query, Some(limit))?;
+        if !direct.is_empty() {
+            return Ok(Self::rank_packages_by_query(direct, query, limit));
+        }
+
+        if query.len() < 3 {
+            return Ok(direct);
+        }
+
+        // Fallback for typo tolerance: broad search by prefix, then rank by similarity.
+        let prefix: String = query.chars().take(3).collect();
+        let fallback_limit = (limit.saturating_mul(3)).min(500);
+        let broad = ParuBackend::search_packages(&prefix, Some(fallback_limit))?;
+        Ok(Self::rank_packages_by_query(broad, query, limit))
+    }
+
+    fn rank_packages_by_query(
+        mut packages: Vec<Package>,
+        query: &str,
+        limit: usize,
+    ) -> Vec<Package> {
+        let norm_q = query.to_lowercase();
+        packages.sort_by(|a, b| {
+            let sa = Self::package_match_score(a, &norm_q);
+            let sb = Self::package_match_score(b, &norm_q);
+            sa.cmp(&sb)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        packages.truncate(limit);
+        packages
+    }
+
+    fn package_match_score(pkg: &Package, query: &str) -> i32 {
+        let name = pkg.name.to_lowercase();
+        let desc = pkg.description.to_lowercase();
+
+        if name == query {
+            return 0;
+        }
+        if name.starts_with(query) {
+            return 1;
+        }
+        if name.contains(query) {
+            return 2;
+        }
+        if desc.contains(query) {
+            return 3;
+        }
+
+        let dist = Self::levenshtein_bounded(&name, query, 4).unwrap_or(10);
+        10 + dist
+    }
+
+    fn levenshtein_bounded(a: &str, b: &str, max_dist: usize) -> Option<i32> {
+        let a_bytes = a.as_bytes();
+        let b_bytes = b.as_bytes();
+        if a_bytes.is_empty() {
+            return Some(b_bytes.len() as i32);
+        }
+        if b_bytes.is_empty() {
+            return Some(a_bytes.len() as i32);
+        }
+
+        let mut prev: Vec<usize> = (0..=b_bytes.len()).collect();
+        let mut cur = vec![0usize; b_bytes.len() + 1];
+
+        for (i, &ac) in a_bytes.iter().enumerate() {
+            cur[0] = i + 1;
+            let mut row_min = cur[0];
+
+            for (j, &bc) in b_bytes.iter().enumerate() {
+                let cost = if ac == bc { 0 } else { 1 };
+                cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+                row_min = row_min.min(cur[j + 1]);
+            }
+
+            if row_min > max_dist {
+                return None;
+            }
+
+            std::mem::swap(&mut prev, &mut cur);
+        }
+
+        let d = prev[b_bytes.len()];
+        if d > max_dist { None } else { Some(d as i32) }
+    }
+
+    fn populate_search_suggestions(
+        recent_box: &Box,
+        trending_box: &Box,
+        search_entry: &SearchEntry,
+    ) {
+        while let Some(child) = recent_box.first_child() {
+            recent_box.remove(&child);
+        }
+        while let Some(child) = trending_box.first_child() {
+            trending_box.remove(&child);
+        }
+
+        let recent = crate::data_store::recent_searches(5);
+        if !recent.is_empty() {
+            let label = Label::new(Some("Recent:"));
+            label.add_css_class("caption");
+            label.add_css_class("dim-label");
+            recent_box.append(&label);
+            for term in recent {
+                let btn = Button::with_label(&term);
+                btn.add_css_class("flat");
+                let entry = search_entry.clone();
+                btn.connect_clicked(move |_| {
+                    entry.set_text(&term);
+                });
+                recent_box.append(&btn);
+            }
+        }
+
+        let trending = crate::data_store::trending_searches(5);
+        if !trending.is_empty() {
+            let label = Label::new(Some("Trending:"));
+            label.add_css_class("caption");
+            label.add_css_class("dim-label");
+            trending_box.append(&label);
+            for term in trending {
+                let btn = Button::with_label(&term);
+                btn.add_css_class("flat");
+                let entry = search_entry.clone();
+                btn.connect_clicked(move |_| {
+                    entry.set_text(&term);
+                });
+                trending_box.append(&btn);
+            }
+        }
     }
 
     fn show_settings_dialog(parent_window: &(impl IsA<gtk4::Window> + gtk4::prelude::WidgetExt)) {
@@ -2387,7 +4024,9 @@ impl ParuGui {
         let auto_row = ComboRow::new();
         auto_row.set_title("Auto Refresh");
         auto_row.set_subtitle("Requires restart to apply");
-        auto_row.set_model(Some(&StringList::new(&["Off", "15 min", "30 min", "1 hour", "6 hours"])));
+        auto_row.set_model(Some(&StringList::new(&[
+            "Off", "15 min", "30 min", "1 hour", "6 hours",
+        ])));
         auto_row.set_selected(match current.auto_refresh_interval.as_str() {
             "15m" => 1,
             "30m" => 2,
@@ -2408,6 +4047,43 @@ impl ParuGui {
         style_combo_row(&auto_row);
         general.add(&auto_row);
 
+        let ttl_row = ComboRow::new();
+        ttl_row.set_title("Cache Stale After");
+        ttl_row.set_model(Some(&StringList::new(&[
+            "15 min", "30 min", "1 hour", "3 hours", "6 hours",
+        ])));
+        ttl_row.set_selected(match current.cache_ttl_minutes {
+            15 => 0,
+            30 => 1,
+            180 => 3,
+            360 => 4,
+            _ => 2,
+        });
+        ttl_row.connect_selected_notify(|row| {
+            let value = match row.selected() {
+                0 => 15,
+                1 => 30,
+                3 => 180,
+                4 => 360,
+                _ => 60,
+            };
+            crate::settings::update(|s| s.cache_ttl_minutes = value);
+        });
+        style_combo_row(&ttl_row);
+        general.add(&ttl_row);
+
+        let row_net_refresh = ActionRow::new();
+        row_net_refresh.set_title("Refresh on Network Reconnect");
+        let sw_net_refresh = gtk4::Switch::new();
+        sw_net_refresh.set_active(current.refresh_on_network_reconnect);
+        sw_net_refresh.connect_state_set(|_, state| {
+            crate::settings::update(|s| s.refresh_on_network_reconnect = state);
+            glib::Propagation::Proceed
+        });
+        style_switch_row(&row_net_refresh, &sw_net_refresh);
+        row_net_refresh.add_suffix(&sw_net_refresh);
+        general.add(&row_net_refresh);
+
         let updates_src_row = ComboRow::new();
         updates_src_row.set_title("Show Updates From");
         updates_src_row.set_model(Some(&StringList::new(&["All", "Repo Only", "AUR Only"])));
@@ -2426,6 +4102,55 @@ impl ParuGui {
         });
         style_combo_row(&updates_src_row);
         general.add(&updates_src_row);
+
+        let update_scope_row = ComboRow::new();
+        update_scope_row.set_title("Default Update Scope");
+        update_scope_row.set_model(Some(&StringList::new(&["All", "Repo Only", "AUR Only"])));
+        update_scope_row.set_selected(match current.default_update_scope.as_str() {
+            "repo-only" => 1,
+            "aur-only" => 2,
+            _ => 0,
+        });
+        update_scope_row.connect_selected_notify(|row| {
+            let value = match row.selected() {
+                1 => "repo-only",
+                2 => "aur-only",
+                _ => "all",
+            };
+            crate::settings::update(|s| s.default_update_scope = value.to_string());
+        });
+        style_combo_row(&update_scope_row);
+        general.add(&update_scope_row);
+
+        let startup_tab_row = ComboRow::new();
+        startup_tab_row.set_title("Startup Tab");
+        startup_tab_row.set_subtitle("Applied on next launch");
+        startup_tab_row.set_model(Some(&StringList::new(&[
+            "Overview",
+            "Search",
+            "Installed",
+            "Updates",
+            "Watchlist",
+        ])));
+        startup_tab_row.set_selected(match current.startup_tab.as_str() {
+            "search" => 1,
+            "installed" => 2,
+            "updates" => 3,
+            "watchlist" => 4,
+            _ => 0,
+        });
+        startup_tab_row.connect_selected_notify(|row| {
+            let value = match row.selected() {
+                1 => "search",
+                2 => "installed",
+                3 => "updates",
+                4 => "watchlist",
+                _ => "dashboard",
+            };
+            crate::settings::update(|s| s.startup_tab = value.to_string());
+        });
+        style_combo_row(&startup_tab_row);
+        general.add(&startup_tab_row);
 
         let search_limit_row = ComboRow::new();
         search_limit_row.set_title("Search Result Limit");
@@ -2493,6 +4218,37 @@ impl ParuGui {
         style_switch_row(&row_news_dates, &sw_news_dates);
         row_news_dates.add_suffix(&sw_news_dates);
         general.add(&row_news_dates);
+
+        let row_links = ActionRow::new();
+        row_links.set_title("Open Links in External Browser");
+        let sw_links = gtk4::Switch::new();
+        sw_links.set_active(current.open_links_in_external_browser);
+        sw_links.connect_state_set(|_, state| {
+            crate::settings::update(|s| s.open_links_in_external_browser = state);
+            glib::Propagation::Proceed
+        });
+        style_switch_row(&row_links, &sw_links);
+        row_links.add_suffix(&sw_links);
+        general.add(&row_links);
+
+        let row_ignored = ActionRow::new();
+        row_ignored.set_title("Ignored Updates");
+        row_ignored.set_subtitle("Comma-separated package names");
+        let ignored_entry = Entry::new();
+        ignored_entry.set_hexpand(true);
+        ignored_entry.set_valign(gtk4::Align::Center);
+        ignored_entry.set_text(&current.ignored_updates.join(", "));
+        ignored_entry.connect_changed(|entry| {
+            let parsed: Vec<String> = entry
+                .text()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            crate::settings::update(|s| s.ignored_updates = parsed);
+        });
+        row_ignored.add_suffix(&ignored_entry);
+        general.add(&row_ignored);
         prefs.add(&general);
 
         let safety = PreferencesGroup::new();
@@ -2558,6 +4314,42 @@ impl ParuGui {
         style_switch_row(&row_confirm_orphans, &sw_confirm_orphans);
         row_confirm_orphans.add_suffix(&sw_confirm_orphans);
         safety.add(&row_confirm_orphans);
+
+        let row_confirm_batch_install = ActionRow::new();
+        row_confirm_batch_install.set_title("Confirm Batch Install");
+        let sw_confirm_batch_install = gtk4::Switch::new();
+        sw_confirm_batch_install.set_active(current.confirm_batch_install);
+        sw_confirm_batch_install.connect_state_set(|_, state| {
+            crate::settings::update(|s| s.confirm_batch_install = state);
+            glib::Propagation::Proceed
+        });
+        style_switch_row(&row_confirm_batch_install, &sw_confirm_batch_install);
+        row_confirm_batch_install.add_suffix(&sw_confirm_batch_install);
+        safety.add(&row_confirm_batch_install);
+
+        let row_confirm_batch_remove = ActionRow::new();
+        row_confirm_batch_remove.set_title("Confirm Batch Remove");
+        let sw_confirm_batch_remove = gtk4::Switch::new();
+        sw_confirm_batch_remove.set_active(current.confirm_batch_remove);
+        sw_confirm_batch_remove.connect_state_set(|_, state| {
+            crate::settings::update(|s| s.confirm_batch_remove = state);
+            glib::Propagation::Proceed
+        });
+        style_switch_row(&row_confirm_batch_remove, &sw_confirm_batch_remove);
+        row_confirm_batch_remove.add_suffix(&sw_confirm_batch_remove);
+        safety.add(&row_confirm_batch_remove);
+
+        let row_strict_aur = ActionRow::new();
+        row_strict_aur.set_title("Always Confirm AUR Batch Installs");
+        let sw_strict_aur = gtk4::Switch::new();
+        sw_strict_aur.set_active(current.always_show_pkgbuild_for_aur);
+        sw_strict_aur.connect_state_set(|_, state| {
+            crate::settings::update(|s| s.always_show_pkgbuild_for_aur = state);
+            glib::Propagation::Proceed
+        });
+        style_switch_row(&row_strict_aur, &sw_strict_aur);
+        row_strict_aur.add_suffix(&sw_strict_aur);
+        safety.add(&row_strict_aur);
         prefs.add(&safety);
 
         let behavior = PreferencesGroup::new();
@@ -2620,6 +4412,71 @@ impl ParuGui {
         style_combo_row(&terminal_row);
         behavior.add(&terminal_row);
 
+        let parallel_row = ComboRow::new();
+        parallel_row.set_title("Max Parallel Tasks");
+        parallel_row.set_model(Some(&StringList::new(&["1", "2", "3", "4"])));
+        parallel_row.set_selected(match current.max_parallel_tasks {
+            2 => 1,
+            3 => 2,
+            4 => 3,
+            _ => 0,
+        });
+        parallel_row.connect_selected_notify(|row| {
+            let value = match row.selected() {
+                1 => 2,
+                2 => 3,
+                3 => 4,
+                _ => 1,
+            };
+            crate::settings::update(|s| s.max_parallel_tasks = value);
+        });
+        style_combo_row(&parallel_row);
+        behavior.add(&parallel_row);
+
+        let output_limit_row = ComboRow::new();
+        output_limit_row.set_title("Task Output Line Limit");
+        output_limit_row.set_model(Some(&StringList::new(&["100", "300", "500", "1000"])));
+        output_limit_row.set_selected(match current.task_output_lines_limit {
+            100 => 0,
+            500 => 2,
+            1000 => 3,
+            _ => 1,
+        });
+        output_limit_row.connect_selected_notify(|row| {
+            let value = match row.selected() {
+                0 => 100,
+                2 => 500,
+                3 => 1000,
+                _ => 300,
+            };
+            crate::settings::update(|s| s.task_output_lines_limit = value);
+        });
+        style_combo_row(&output_limit_row);
+        behavior.add(&output_limit_row);
+
+        let auto_clear_row = ComboRow::new();
+        auto_clear_row.set_title("Auto-Clear Completed Tasks");
+        auto_clear_row.set_model(Some(&StringList::new(&[
+            "Off", "5 min", "15 min", "60 min",
+        ])));
+        auto_clear_row.set_selected(match current.auto_clear_completed_tasks_minutes {
+            5 => 1,
+            15 => 2,
+            60 => 3,
+            _ => 0,
+        });
+        auto_clear_row.connect_selected_notify(|row| {
+            let value = match row.selected() {
+                1 => 5,
+                2 => 15,
+                3 => 60,
+                _ => 0,
+            };
+            crate::settings::update(|s| s.auto_clear_completed_tasks_minutes = value);
+        });
+        style_combo_row(&auto_clear_row);
+        behavior.add(&auto_clear_row);
+
         let row_single_click = ActionRow::new();
         row_single_click.set_title("Open Details on Single Click");
         let sw_single_click = gtk4::Switch::new();
@@ -2631,6 +4488,18 @@ impl ParuGui {
         style_switch_row(&row_single_click, &sw_single_click);
         row_single_click.add_suffix(&sw_single_click);
         behavior.add(&row_single_click);
+
+        let row_sizes = ActionRow::new();
+        row_sizes.set_title("Show Package Sizes in Lists");
+        let sw_sizes = gtk4::Switch::new();
+        sw_sizes.set_active(current.show_package_sizes_in_lists);
+        sw_sizes.connect_state_set(|_, state| {
+            crate::settings::update(|s| s.show_package_sizes_in_lists = state);
+            glib::Propagation::Proceed
+        });
+        style_switch_row(&row_sizes, &sw_sizes);
+        row_sizes.add_suffix(&sw_sizes);
+        behavior.add(&row_sizes);
         prefs.add(&behavior);
 
         let notifications = PreferencesGroup::new();

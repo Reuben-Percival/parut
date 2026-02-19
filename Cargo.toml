@@ -2,7 +2,7 @@
 name = "parut"
 version = "0.2.0"
 edition = "2024"
-authors = ["Parut Contributors"]
+authors = ["Reuben Percival"]
 description = "A beautiful graphical frontend for the Paru AUR helper"
 license = "GPL-3.0"
 repository = "https://github.com/parut/parut"
