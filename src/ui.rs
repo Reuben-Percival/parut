@@ -19,6 +19,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+type PackageVec = Rc<RefCell<Vec<Package>>>;
+type ListBoxRc = Rc<RefCell<ListBox>>;
+type LabelRc = Rc<RefCell<Label>>;
+type BoxRc = Rc<RefCell<Box>>;
+
 pub struct ParuGui {
     main_box: Box,
     #[allow(dead_code)]
@@ -31,6 +36,7 @@ pub struct ParuGui {
     auto_refresh_timer_id: Rc<RefCell<Option<glib::SourceId>>>,
 }
 
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 impl ParuGui {
     pub fn new() -> Self {
         let main_box = Box::new(Orientation::Vertical, 0);
@@ -112,11 +118,10 @@ impl ParuGui {
 
         let settings_btn_weak = settings_btn.downgrade();
         settings_btn.connect_clicked(move |_| {
-            if let Some(btn) = settings_btn_weak.upgrade() {
-                if let Some(window) = btn.root().and_then(|w| w.downcast::<Window>().ok()) {
+            if let Some(btn) = settings_btn_weak.upgrade()
+                && let Some(window) = btn.root().and_then(|w| w.downcast::<Window>().ok()) {
                     Self::show_settings_dialog(&window);
                 }
-            }
         });
         header_bar.pack_end(&settings_btn);
 
@@ -698,16 +703,7 @@ impl ParuGui {
 
     fn create_dashboard_view(
         task_queue: Arc<TaskQueue>,
-    ) -> (
-        ScrolledWindow,
-        (
-            Rc<RefCell<Label>>,
-            Rc<RefCell<Label>>,
-            Rc<RefCell<Label>>,
-            Rc<RefCell<Box>>,
-            Rc<RefCell<Label>>,
-        ),
-    ) {
+    ) -> (ScrolledWindow, (LabelRc, LabelRc, LabelRc, BoxRc, LabelRc)) {
         let vbox = Box::new(Orientation::Vertical, 24);
         vbox.set_margin_start(24);
         vbox.set_margin_end(24);
@@ -981,9 +977,9 @@ impl ParuGui {
     }
 
     fn refresh_dashboard_stats(
-        installed_label: &Rc<RefCell<Label>>,
-        updates_label: &Rc<RefCell<Label>>,
-        aur_label: &Rc<RefCell<Label>>,
+        installed_label: &LabelRc,
+        updates_label: &LabelRc,
+        aur_label: &LabelRc,
     ) {
         let installed_label = installed_label.clone();
         let updates_label = updates_label.clone();
@@ -1050,7 +1046,7 @@ impl ParuGui {
         }
     }
 
-    fn refresh_arch_news(news_list: &Rc<RefCell<Box>>, news_status: &Rc<RefCell<Label>>) {
+    fn refresh_arch_news(news_list: &BoxRc, news_status: &LabelRc) {
         if !crate::settings::get().show_arch_news {
             while let Some(child) = news_list.borrow().first_child() {
                 news_list.borrow().remove(&child);
@@ -1685,8 +1681,8 @@ impl ParuGui {
                     phase_eta.append(&phase_label);
                 }
 
-                if let Some(started_at) = task.started_at_unix {
-                    if progress > 0.01 {
+                if let Some(started_at) = task.started_at_unix
+                    && progress > 0.01 {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .ok()
@@ -1700,7 +1696,6 @@ impl ParuGui {
                         eta_label.add_css_class("dim-label");
                         phase_eta.append(&eta_label);
                     }
-                }
 
                 row_box.append(&phase_eta);
             } else {
@@ -1836,7 +1831,7 @@ impl ParuGui {
 
     fn create_search_view(
         task_queue: Arc<TaskQueue>,
-    ) -> (Box, Rc<RefCell<Vec<Package>>>, Rc<RefCell<ListBox>>) {
+    ) -> (Box, PackageVec, ListBoxRc) {
         let vbox = Box::new(Orientation::Vertical, 16);
         vbox.set_margin_start(20);
         vbox.set_margin_end(20);
@@ -2169,13 +2164,7 @@ impl ParuGui {
 
     fn create_installed_view(
         task_queue: Arc<TaskQueue>,
-    ) -> (
-        Box,
-        Rc<RefCell<Vec<Package>>>,
-        Rc<RefCell<ListBox>>,
-        Rc<RefCell<SearchEntry>>,
-        Rc<dyn Fn()>,
-    ) {
+    ) -> (Box, PackageVec, ListBoxRc, Rc<RefCell<SearchEntry>>, Rc<dyn Fn()>) {
         let vbox = Box::new(Orientation::Vertical, 16);
         vbox.set_margin_start(20);
         vbox.set_margin_end(20);
@@ -2241,6 +2230,7 @@ impl ParuGui {
         let list_box = ListBox::new();
         list_box.add_css_class("boxed-list");
         scrolled.set_child(Some(&list_box));
+        vbox.append(&scrolled);
 
         let packages = Rc::new(RefCell::new(Vec::<Package>::new()));
         let list_box_rc = Rc::new(RefCell::new(list_box));
@@ -2376,12 +2366,7 @@ impl ParuGui {
 
     fn create_updates_view(
         task_queue: Arc<TaskQueue>,
-    ) -> (
-        Box,
-        Rc<RefCell<Vec<Package>>>,
-        Rc<RefCell<ListBox>>,
-        Rc<dyn Fn()>,
-    ) {
+    ) -> (Box, PackageVec, ListBoxRc, Rc<dyn Fn()>) {
         let vbox = Box::new(Orientation::Vertical, 16);
         vbox.set_margin_start(20);
         vbox.set_margin_end(20);
@@ -2674,8 +2659,8 @@ impl ParuGui {
 
     fn create_watchlist_view(
         task_queue: Arc<TaskQueue>,
-        installed_packages: Rc<RefCell<Vec<Package>>>,
-        updates: Rc<RefCell<Vec<Package>>>,
+        installed_packages: PackageVec,
+        updates: PackageVec,
     ) -> (Box, Rc<dyn Fn()>) {
         let vbox = Box::new(Orientation::Vertical, 16);
         vbox.set_margin_start(20);
@@ -2793,13 +2778,12 @@ impl ParuGui {
                     let name_for_details = pkg_name.clone();
                     let row_weak = row.downgrade();
                     details_btn.connect_clicked(move |_| {
-                        if let Some(r) = row_weak.upgrade() {
-                            if let Some(window) =
+                        if let Some(r) = row_weak.upgrade()
+                            && let Some(window) =
                                 r.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
                             {
                                 Self::show_package_details_dialog(&window, &name_for_details);
                             }
-                        }
                     });
                     actions.append(&details_btn);
 
@@ -2966,15 +2950,14 @@ impl ParuGui {
         };
 
         info_box.append(&version_box);
-        if crate::settings::get().show_package_sizes_in_lists {
-            if let Some(size_text) = Self::query_package_size_text(&package.name) {
+        if crate::settings::get().show_package_sizes_in_lists
+            && let Some(size_text) = Self::query_package_size_text(&package.name) {
                 let size_label = Label::new(Some(&size_text));
                 size_label.add_css_class("caption");
                 size_label.add_css_class("dim-label");
                 size_label.set_halign(gtk4::Align::Start);
                 info_box.append(&size_label);
             }
-        }
 
         // Description
         if !package.description.is_empty() {
@@ -2995,13 +2978,12 @@ impl ParuGui {
             let click = gtk4::GestureClick::new();
             click.set_button(1);
             click.connect_released(move |_, _, _, _| {
-                if let Some(info) = info_box_weak.upgrade() {
-                    if let Some(window) =
+                if let Some(info) = info_box_weak.upgrade()
+                    && let Some(window) =
                         info.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
                     {
                         Self::show_package_details_dialog(&window, &pkg_name_click);
                     }
-                }
             });
             info_box.add_controller(click);
         }
@@ -3024,12 +3006,11 @@ impl ParuGui {
             let pkg_name_clone = package.name.clone();
             let row_weak = row_box.downgrade();
             info_btn.connect_clicked(move |_| {
-                if let Some(row) = row_weak.upgrade() {
-                    if let Some(window) = row.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
+                if let Some(row) = row_weak.upgrade()
+                    && let Some(window) = row.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
                     {
                         Self::show_package_details_dialog(&window, &pkg_name_clone);
                     }
-                }
             });
             action_box.append(&info_btn);
 
@@ -3047,8 +3028,8 @@ impl ParuGui {
                     let needs_confirm = crate::settings::get().confirm_remove
                         || crate::settings::get().confirm_actions;
                     if needs_confirm {
-                        if let Some(row_box) = row_box_weak.upgrade() {
-                            if let Some(window) = row_box
+                        if let Some(row_box) = row_box_weak.upgrade()
+                            && let Some(window) = row_box
                                 .root()
                                 .and_then(|w| w.downcast::<gtk4::Window>().ok())
                             {
@@ -3067,7 +3048,6 @@ impl ParuGui {
                                     },
                                 );
                             }
-                        }
                     } else {
                         log_info(&format!("Adding remove task for package: {}", pkg_name));
                         task_queue.add_task(TaskType::Remove, pkg_name.clone());
@@ -3123,12 +3103,11 @@ impl ParuGui {
             let pkg_name_clone = package.name.clone();
             let row_weak = row_box.downgrade();
             info_btn.connect_clicked(move |_| {
-                if let Some(row) = row_weak.upgrade() {
-                    if let Some(window) = row.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
+                if let Some(row) = row_weak.upgrade()
+                    && let Some(window) = row.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
                     {
                         Self::show_package_details_dialog(&window, &pkg_name_clone);
                     }
-                }
             });
             action_box.append(&info_btn);
             row_box.append(&action_box);
@@ -3214,15 +3193,14 @@ impl ParuGui {
         new_ver.add_css_class("version-update");
         versions.append(&new_ver);
         info_box.append(&versions);
-        if crate::settings::get().show_package_sizes_in_lists {
-            if let Some(size_text) = Self::query_package_size_text(&package.name) {
+        if crate::settings::get().show_package_sizes_in_lists
+            && let Some(size_text) = Self::query_package_size_text(&package.name) {
                 let size_label = Label::new(Some(&size_text));
                 size_label.add_css_class("caption");
                 size_label.add_css_class("dim-label");
                 size_label.set_halign(gtk4::Align::Start);
                 info_box.append(&size_label);
             }
-        }
 
         row_box.append(&info_box);
 
@@ -3239,11 +3217,10 @@ impl ParuGui {
         let pkg_for_info = package.name.clone();
         let row_weak = row_box.downgrade();
         info_btn.connect_clicked(move |_| {
-            if let Some(row) = row_weak.upgrade() {
-                if let Some(window) = row.root().and_then(|w| w.downcast::<gtk4::Window>().ok()) {
+            if let Some(row) = row_weak.upgrade()
+                && let Some(window) = row.root().and_then(|w| w.downcast::<gtk4::Window>().ok()) {
                     Self::show_package_details_dialog(&window, &pkg_for_info);
                 }
-            }
         });
         action_box.append(&info_btn);
 
@@ -3479,15 +3456,25 @@ impl ParuGui {
         version_label.add_css_class("version-badge");
         version_label.set_halign(gtk4::Align::Start);
         info_box.append(&version_label);
-        if crate::settings::get().show_package_sizes_in_lists {
-            if let Some(size_text) = Self::query_package_size_text(&package.name) {
+
+        // Description (if available)
+        if !package.description.is_empty() {
+            let desc_label = Label::new(Some(&package.description));
+            desc_label.add_css_class("dim-label");
+            desc_label.add_css_class("caption");
+            desc_label.set_halign(gtk4::Align::Start);
+            desc_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            info_box.append(&desc_label);
+        }
+
+        if crate::settings::get().show_package_sizes_in_lists
+            && let Some(size_text) = Self::query_package_size_text(&package.name) {
                 let size_label = Label::new(Some(&size_text));
                 size_label.add_css_class("caption");
                 size_label.add_css_class("dim-label");
                 size_label.set_halign(gtk4::Align::Start);
                 info_box.append(&size_label);
             }
-        }
 
         if crate::settings::get().show_package_details_on_single_click {
             let pkg_name_click = package.name.clone();
@@ -3495,13 +3482,12 @@ impl ParuGui {
             let click = gtk4::GestureClick::new();
             click.set_button(1);
             click.connect_released(move |_, _, _, _| {
-                if let Some(info) = info_box_weak.upgrade() {
-                    if let Some(window) =
+                if let Some(info) = info_box_weak.upgrade()
+                    && let Some(window) =
                         info.root().and_then(|w| w.downcast::<gtk4::Window>().ok())
                     {
                         Self::show_package_details_dialog(&window, &pkg_name_click);
                     }
-                }
             });
             info_box.add_controller(click);
         }
@@ -3525,11 +3511,10 @@ impl ParuGui {
         let pkg_name_info = package.name.clone();
         let row_weak = row_box.downgrade();
         info_btn.connect_clicked(move |_| {
-            if let Some(row) = row_weak.upgrade() {
-                if let Some(window) = row.root().and_then(|w| w.downcast::<gtk4::Window>().ok()) {
+            if let Some(row) = row_weak.upgrade()
+                && let Some(window) = row.root().and_then(|w| w.downcast::<gtk4::Window>().ok()) {
                     Self::show_package_details_dialog(&window, &pkg_name_info);
                 }
-            }
         });
         action_box.append(&info_btn);
 
@@ -3546,8 +3531,8 @@ impl ParuGui {
             let needs_confirm =
                 crate::settings::get().confirm_remove || crate::settings::get().confirm_actions;
             if needs_confirm {
-                if let Some(row_box) = row_box_weak2.upgrade() {
-                    if let Some(window) = row_box
+                if let Some(row_box) = row_box_weak2.upgrade()
+                    && let Some(window) = row_box
                         .root()
                         .and_then(|w| w.downcast::<gtk4::Window>().ok())
                     {
@@ -3563,7 +3548,6 @@ impl ParuGui {
                             },
                         );
                     }
-                }
             } else {
                 log_info(&format!("Adding remove task for package: {}", pkg_name));
                 task_queue.add_task(TaskType::Remove, pkg_name.clone());
@@ -3577,11 +3561,11 @@ impl ParuGui {
     }
 
     fn refresh_installed(
-        list_box: &Rc<RefCell<ListBox>>,
-        packages: &Rc<RefCell<Vec<Package>>>,
+        list_box: &ListBoxRc,
+        packages: &PackageVec,
         task_queue: Arc<TaskQueue>,
         render_installed: Option<Rc<dyn Fn()>>,
-        refresh_label: Option<Rc<RefCell<Label>>>,
+        refresh_label: Option<LabelRc>,
         refresh_timer: Option<Rc<RefCell<Option<glib::SourceId>>>>,
     ) {
         let list_box = list_box.clone();
@@ -3593,7 +3577,7 @@ impl ParuGui {
         let refresh_timer_err = refresh_timer;
 
         Self::run_blocking(
-            move || ParuBackend::list_installed(),
+            ParuBackend::list_installed,
             move |result| match result {
                 Ok(pkgs) => {
                     crate::data_store::set_cached_installed(&pkgs);
@@ -3622,11 +3606,11 @@ impl ParuGui {
     }
 
     fn refresh_updates(
-        list_box: &Rc<RefCell<ListBox>>,
-        packages: &Rc<RefCell<Vec<Package>>>,
+        list_box: &ListBoxRc,
+        packages: &PackageVec,
         task_queue: Arc<TaskQueue>,
         render_updates: Option<Rc<dyn Fn()>>,
-        refresh_label: Option<Rc<RefCell<Label>>>,
+        refresh_label: Option<LabelRc>,
         refresh_timer: Option<Rc<RefCell<Option<glib::SourceId>>>>,
     ) {
         let list_box = list_box.clone();
@@ -3638,7 +3622,7 @@ impl ParuGui {
         let refresh_timer_err = refresh_timer;
 
         Self::run_blocking(
-            move || ParuBackend::list_updates(),
+            ParuBackend::list_updates,
             move |result| match result {
                 Ok(pkgs) => {
                     let pkgs = Self::filter_updates_by_source(pkgs);

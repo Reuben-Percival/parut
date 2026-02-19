@@ -108,12 +108,11 @@ pub fn update<F>(f: F)
 where
     F: FnOnce(&mut AppSettings),
 {
-    if let Some(lock) = SETTINGS.get() {
-        if let Ok(mut settings) = lock.lock() {
+    if let Some(lock) = SETTINGS.get()
+        && let Ok(mut settings) = lock.lock() {
             f(&mut settings);
             let _ = save_settings(&settings);
         }
-    }
 }
 
 pub fn update_and_get<F, T>(f: F) -> Option<T>

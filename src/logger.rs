@@ -138,7 +138,7 @@ impl LogLevel {
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
 pub fn get_logger() -> &'static Logger {
-    LOGGER.get_or_init(|| Logger::new())
+    LOGGER.get_or_init(Logger::new)
 }
 
 pub fn log_info(message: &str) {

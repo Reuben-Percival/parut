@@ -50,6 +50,7 @@ impl Task {
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub struct TaskQueue {
     tasks: Arc<Mutex<Vec<Task>>>,
     next_id: Arc<Mutex<usize>>,
@@ -156,29 +157,25 @@ impl TaskQueue {
         // Parse download progress: "downloading... 45%"
         if let Some(pct_pos) = line.find('%') {
             let before = &line[..pct_pos];
-            if let Some(num_start) = before.rfind(|c: char| !c.is_ascii_digit() && c != '.') {
-                if let Ok(pct) = before[num_start + 1..].parse::<f64>() {
+            if let Some(num_start) = before.rfind(|c: char| !c.is_ascii_digit() && c != '.')
+                && let Ok(pct) = before[num_start + 1..].parse::<f64>() {
                     return Some(pct / 100.0);
                 }
-            }
         }
 
         // Parse makepkg progress: "(1/4) checking keys..."
-        if line.contains("(") && line.contains("/") && line.contains(")") {
-            if let Some(start) = line.find('(') {
-                if let Some(end) = line.find(')') {
+        if line.contains("(") && line.contains("/") && line.contains(")")
+            && let Some(start) = line.find('(')
+                && let Some(end) = line.find(')') {
                     let nums = &line[start + 1..end];
-                    if let Some(slash) = nums.find('/') {
-                        if let (Ok(current), Ok(total)) = (
+                    if let Some(slash) = nums.find('/')
+                        && let (Ok(current), Ok(total)) = (
                             nums[..slash].parse::<f64>(),
                             nums[slash + 1..].parse::<f64>(),
                         ) {
                             return Some(current / total);
                         }
-                    }
                 }
-            }
-        }
 
         None
     }
@@ -264,11 +261,10 @@ impl TaskQueue {
         tasks.retain(|t| !(t.id == task_id && t.status == TaskStatus::Queued));
         let changed = tasks.len() != before;
 
-        if changed {
-            if let Some(callback) = self.update_callback.lock().unwrap().as_ref() {
+        if changed
+            && let Some(callback) = self.update_callback.lock().unwrap().as_ref() {
                 callback();
             }
-        }
 
         changed
     }
@@ -401,14 +397,14 @@ impl TaskQueue {
     pub fn retry_failed_task(&self, task_id: usize) -> Option<usize> {
         let (task_type, package_name) = {
             let tasks = self.tasks.lock().unwrap();
-            let failed = tasks.iter().find(|t| t.id == task_id).and_then(|t| {
+            
+            tasks.iter().find(|t| t.id == task_id).and_then(|t| {
                 if matches!(t.status, TaskStatus::Failed(_)) {
                     Some((t.task_type.clone(), t.package_name.clone()))
                 } else {
                     None
                 }
-            })?;
-            failed
+            })?
         };
 
         Some(self.add_task(task_type, package_name))
